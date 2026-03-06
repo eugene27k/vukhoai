@@ -1,0 +1,7 @@
+.build/
+.swiftpm/
+DerivedData/
+.DS_Store
+.venv/
+
+Sources/GhostMicApp/Resources/__pycache__/

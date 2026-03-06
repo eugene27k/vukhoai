@@ -1,0 +1,6 @@
+# Optional diarization stack.
+# Usually requires a dedicated Python env (recommended Python 3.11/3.12) and model access setup.
+-r requirements.txt
+
+whisperx>=3.2.0
+pyannote.audio>=3.3.0

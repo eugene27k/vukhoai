@@ -1,0 +1,3 @@
+# Minimal runtime for GhostMic MVP transcription (offline)
+# Keeps installation compatible and avoids whisperx/faster-whisper resolver conflicts.
+faster-whisper>=1.2.0
