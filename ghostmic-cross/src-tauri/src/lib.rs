@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -86,10 +87,15 @@ struct ImportJob {
     output_txt_path: Option<String>,
     meta_json_path: Option<String>,
     error_message: Option<String>,
+    notice_message: Option<String>,
+    processing_elapsed_seconds: Option<f64>,
+    audio_to_processing_ratio: Option<f64>,
     progress_percent: Option<f64>,
     progress_stage: Option<String>,
     progress_eta_seconds: Option<f64>,
     processing_started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    is_paused: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +105,8 @@ struct AppSettings {
     diarization_enabled: bool,
     output_folder_path: String,
     python_path: Option<String>,
+    diarization_python_path: Option<String>,
+    huggingface_token: Option<String>,
     openai_model: String,
     openai_api_key: Option<String>,
 }
@@ -111,6 +119,8 @@ impl AppSettings {
             diarization_enabled: true,
             output_folder_path: default_output_directory().to_string_lossy().into_owned(),
             python_path: None,
+            diarization_python_path: None,
+            huggingface_token: None,
             openai_model: "gpt-4o-mini".to_string(),
             openai_api_key: None,
         }
@@ -145,6 +155,8 @@ struct SettingsUpdate {
     diarization_enabled: bool,
     output_folder_path: String,
     python_path: Option<String>,
+    diarization_python_path: Option<String>,
+    huggingface_token: Option<String>,
     openai_model: String,
     openai_api_key: Option<String>,
 }
@@ -180,6 +192,11 @@ struct ProgressPayload {
     eta_seconds: Option<f64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct NoticePayload {
+    message: String,
+}
+
 #[derive(Debug)]
 struct RunResult {
     exit_code: i32,
@@ -187,8 +204,47 @@ struct RunResult {
     stderr_output: String,
     normalized_path: String,
     duration_seconds: f64,
+    processing_elapsed_seconds: f64,
     output_path: String,
     meta_path: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PythonRuntimeCapabilities {
+    has_faster_whisper: bool,
+    has_whisperx: bool,
+    has_pyannote_audio: bool,
+}
+
+impl PythonRuntimeCapabilities {
+    fn supports_transcription(self) -> bool {
+        self.has_faster_whisper || self.has_whisperx
+    }
+
+    fn supports_diarization(self) -> bool {
+        self.has_whisperx && self.has_pyannote_audio
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PythonRuntimeCapabilitiesJson {
+    #[serde(default)]
+    faster_whisper: bool,
+    #[serde(default)]
+    whisperx: bool,
+    #[serde(default)]
+    pyannote_audio: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct JobMetadata {
+    #[serde(default)]
+    diarization_requested: bool,
+    #[serde(default)]
+    diarization_applied: bool,
+    diarization_fallback_reason: Option<String>,
+    #[serde(default)]
+    fallback_events: Vec<String>,
 }
 
 #[tauri::command]
@@ -226,6 +282,18 @@ fn update_settings(
         output_folder_path: output_path.to_string_lossy().into_owned(),
         python_path: payload
             .python_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
+        diarization_python_path: payload
+            .diarization_python_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
+        huggingface_token: payload
+            .huggingface_token
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty())
@@ -286,10 +354,14 @@ fn enqueue_job(state: State<'_, AppShared>, input_path: String) -> Result<Import
         output_txt_path: None,
         meta_json_path: None,
         error_message: None,
+        notice_message: None,
+        processing_elapsed_seconds: None,
+        audio_to_processing_ratio: None,
         progress_percent: None,
         progress_stage: None,
         progress_eta_seconds: None,
         processing_started_at: None,
+        is_paused: false,
     };
 
     guard.persisted.jobs.push(job.clone());
@@ -316,10 +388,14 @@ fn retry_job(state: State<'_, AppShared>, job_id: String) -> Result<(), String> 
 
     job.status = JobStatus::Queued;
     job.error_message = None;
+    job.notice_message = None;
+    job.processing_elapsed_seconds = None;
+    job.audio_to_processing_ratio = None;
     job.progress_percent = None;
     job.progress_stage = None;
     job.progress_eta_seconds = None;
     job.processing_started_at = None;
+    job.is_paused = false;
 
     drop(guard);
     persist_state(&state.core)?;
@@ -369,12 +445,76 @@ fn cancel_job(state: State<'_, AppShared>, job_id: String) -> Result<(), String>
         JobStatus::Queued | JobStatus::Processing => {
             job.status = JobStatus::Cancelled;
             job.error_message = Some("Cancelled by user.".to_string());
+            job.notice_message = None;
+            job.processing_elapsed_seconds = None;
+            job.audio_to_processing_ratio = None;
             job.progress_percent = None;
             job.progress_stage = None;
             job.progress_eta_seconds = None;
             job.processing_started_at = None;
+            job.is_paused = false;
         }
         JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled => {}
+    }
+
+    drop(guard);
+    persist_state(&state.core)?;
+    emit_full_state(&state.core);
+    Ok(())
+}
+
+#[tauri::command]
+fn pause_job(state: State<'_, AppShared>, job_id: String) -> Result<(), String> {
+    let mut guard = state
+        .core
+        .worker
+        .lock()
+        .map_err(|_| "Failed to lock state".to_string())?;
+
+    if guard.active_job_id.as_deref() != Some(job_id.as_str()) {
+        return Err("Pause is available only for currently processing job.".to_string());
+    }
+
+    let child = guard
+        .active_child
+        .clone()
+        .ok_or_else(|| "No active transcription process found.".to_string())?;
+
+    pause_child_process(child)?;
+
+    if let Some(job) = guard.persisted.jobs.iter_mut().find(|j| j.id == job_id) {
+        job.is_paused = true;
+        job.progress_stage = Some("Paused by user".to_string());
+    }
+
+    drop(guard);
+    persist_state(&state.core)?;
+    emit_full_state(&state.core);
+    Ok(())
+}
+
+#[tauri::command]
+fn resume_job(state: State<'_, AppShared>, job_id: String) -> Result<(), String> {
+    let mut guard = state
+        .core
+        .worker
+        .lock()
+        .map_err(|_| "Failed to lock state".to_string())?;
+
+    if guard.active_job_id.as_deref() != Some(job_id.as_str()) {
+        return Err("Resume is available only for currently processing job.".to_string());
+    }
+
+    let child = guard
+        .active_child
+        .clone()
+        .ok_or_else(|| "No active transcription process found.".to_string())?;
+
+    resume_child_process(child)?;
+
+    if let Some(job) = guard.persisted.jobs.iter_mut().find(|j| j.id == job_id) {
+        job.is_paused = false;
+        job.progress_stage = Some("Resumed".to_string());
     }
 
     drop(guard);
@@ -518,10 +658,14 @@ fn worker_loop(shared: AppShared) {
             if let Some(job) = guard.persisted.jobs.iter_mut().find(|j| j.id == *job_id) {
                 job.status = JobStatus::Processing;
                 job.error_message = None;
+                job.notice_message = None;
+                job.processing_elapsed_seconds = None;
+                job.audio_to_processing_ratio = None;
                 job.progress_percent = Some(1.0);
                 job.progress_stage = Some("Preparing audio".to_string());
                 job.progress_eta_seconds = None;
                 job.processing_started_at = Some(Utc::now());
+                job.is_paused = false;
             }
 
             guard.active_job_id = Some(job_id.clone());
@@ -539,6 +683,28 @@ fn worker_loop(shared: AppShared) {
 
 fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<RunResult, String>) {
     let mut removed_job: Option<ImportJob> = None;
+    let processing_metrics = match &run_result {
+        Ok(result) => {
+            let ratio = compute_audio_to_processing_ratio(
+                result.duration_seconds,
+                result.processing_elapsed_seconds,
+            );
+            if result.exit_code == 0 {
+                persist_job_metrics_to_metadata(
+                    &result.meta_path,
+                    result.duration_seconds,
+                    result.processing_elapsed_seconds,
+                    ratio,
+                );
+            }
+            Some((result.processing_elapsed_seconds, ratio))
+        }
+        Err(_) => None,
+    };
+    let success_notice = match &run_result {
+        Ok(result) if result.exit_code == 0 => build_job_notice(&shared.core, &result.meta_path),
+        _ => None,
+    };
 
     {
         let mut guard = match shared.core.worker.lock() {
@@ -554,17 +720,22 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
                 Ok(result) => {
                     job.normalized_audio_path = Some(result.normalized_path.clone());
                     job.duration_seconds = Some(result.duration_seconds);
+                    job.processing_elapsed_seconds = Some(result.processing_elapsed_seconds);
+                    job.audio_to_processing_ratio =
+                        processing_metrics.as_ref().and_then(|metrics| metrics.1);
 
                     if should_delete {
                         // handled below after remove
                     } else if was_cancelled {
                         job.status = JobStatus::Cancelled;
                         job.error_message = Some("Cancelled by user.".to_string());
+                        job.is_paused = false;
                     } else if result.exit_code == 0 {
                         job.status = JobStatus::Done;
                         job.output_txt_path = Some(result.output_path.clone());
                         job.meta_json_path = Some(result.meta_path.clone());
                         job.error_message = None;
+                        job.notice_message = success_notice.clone();
                     } else {
                         let combined = format!(
                             "{}\n{}",
@@ -579,6 +750,7 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
                         } else {
                             combined
                         });
+                        job.notice_message = None;
                     }
                 }
                 Err(error) => {
@@ -587,9 +759,13 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
                     } else if was_cancelled {
                         job.status = JobStatus::Cancelled;
                         job.error_message = Some("Cancelled by user.".to_string());
+                        job.is_paused = false;
                     } else {
                         job.status = JobStatus::Failed;
                         job.error_message = Some(error);
+                        job.notice_message = None;
+                        job.processing_elapsed_seconds = None;
+                        job.audio_to_processing_ratio = None;
                     }
                 }
             }
@@ -598,6 +774,7 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
             job.progress_stage = None;
             job.progress_eta_seconds = None;
             job.processing_started_at = None;
+            job.is_paused = false;
         }
 
         if should_delete {
@@ -619,6 +796,7 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
 }
 
 fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
+    let run_started = Instant::now();
     let (settings, job) = {
         let guard = shared
             .core
@@ -669,7 +847,8 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
             .map_err(|e| format!("Unable to prepare output directory: {e}"))?;
     }
 
-    let python_binary = resolve_python_binary(&settings)?;
+    let python_binary =
+        resolve_python_binary(&settings, &shared.core.script_path, job.diarization_enabled)?;
 
     let mut command = Command::new(&python_binary);
     command
@@ -690,6 +869,16 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
         .arg(format!("{:.3}", prepared.duration_seconds))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    if let Some(token) = settings
+        .huggingface_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        command.env("HF_TOKEN", token);
+        command.env("HUGGINGFACE_HUB_TOKEN", token);
+    }
 
     let child = command
         .spawn()
@@ -751,7 +940,7 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
             continue;
         }
 
-        if !apply_progress_line(shared, job_id, &trimmed) {
+        if !apply_runtime_line(shared, job_id, &trimmed) {
             stdout_non_progress.push(trimmed);
         }
     }
@@ -782,12 +971,33 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
         stderr_output,
         normalized_path: prepared.path,
         duration_seconds: prepared.duration_seconds,
+        processing_elapsed_seconds: run_started.elapsed().as_secs_f64(),
         output_path,
         meta_path,
     })
 }
 
-fn apply_progress_line(shared: &AppShared, job_id: &str, line: &str) -> bool {
+fn apply_runtime_line(shared: &AppShared, job_id: &str, line: &str) -> bool {
+    if let Some(payload) = line.strip_prefix("GHOSTMIC_NOTICE ") {
+        let parsed = serde_json::from_str::<NoticePayload>(payload);
+        let Ok(notice) = parsed else {
+            return false;
+        };
+
+        if let Ok(mut guard) = shared.core.worker.lock() {
+            if let Some(job) = guard.persisted.jobs.iter_mut().find(|j| j.id == job_id) {
+                let message = notice.message.trim();
+                if !message.is_empty() {
+                    job.notice_message = Some(message.to_string());
+                }
+            }
+        }
+
+        let _ = persist_state(&shared.core);
+        emit_full_state(&shared.core);
+        return true;
+    }
+
     let Some(payload) = line.strip_prefix("GHOSTMIC_PROGRESS ") else {
         return false;
     };
@@ -818,6 +1028,44 @@ fn kill_child(child: Arc<Mutex<Child>>) -> Result<(), String> {
     guard
         .kill()
         .map_err(|e| format!("Unable to stop transcription process: {e}"))
+}
+
+#[cfg(unix)]
+fn pause_child_process(child: Arc<Mutex<Child>>) -> Result<(), String> {
+    let guard = child
+        .lock()
+        .map_err(|_| "Failed to lock process".to_string())?;
+    let pid = guard.id() as i32;
+    let result = unsafe { libc::kill(pid, libc::SIGSTOP) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err("Unable to pause transcription process.".to_string())
+    }
+}
+
+#[cfg(not(unix))]
+fn pause_child_process(_child: Arc<Mutex<Child>>) -> Result<(), String> {
+    Err("Pause is not supported on this platform yet.".to_string())
+}
+
+#[cfg(unix)]
+fn resume_child_process(child: Arc<Mutex<Child>>) -> Result<(), String> {
+    let guard = child
+        .lock()
+        .map_err(|_| "Failed to lock process".to_string())?;
+    let pid = guard.id() as i32;
+    let result = unsafe { libc::kill(pid, libc::SIGCONT) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err("Unable to resume transcription process.".to_string())
+    }
+}
+
+#[cfg(not(unix))]
+fn resume_child_process(_child: Arc<Mutex<Child>>) -> Result<(), String> {
+    Err("Resume is not supported on this platform yet.".to_string())
 }
 
 struct PreparedAudio {
@@ -893,28 +1141,275 @@ fn output_txt_path(settings: &AppSettings, job: &ImportJob) -> String {
         .into_owned()
 }
 
-fn resolve_python_binary(settings: &AppSettings) -> Result<String, String> {
-    let candidates = [
-        settings
-            .python_path
+fn resolve_python_binary(
+    settings: &AppSettings,
+    script_path: &Path,
+    diarization_enabled: bool,
+) -> Result<String, String> {
+    let mut candidates: Vec<String> = Vec::new();
+
+    if diarization_enabled {
+        if let Some(value) = settings
+            .diarization_python_path
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .map(str::to_string),
-        std::env::var("GHOSTMIC_PYTHON").ok(),
-        Some("python3".to_string()),
-        Some("python".to_string()),
-    ];
+        {
+            candidates.push(value.to_string());
+        }
 
-    for candidate in candidates.into_iter().flatten() {
-        if Command::new(&candidate).arg("--version").output().is_ok() {
+        if let Ok(env_python) = std::env::var("GHOSTMIC_DIARIZATION_PYTHON") {
+            if !env_python.trim().is_empty() {
+                candidates.push(env_python);
+            }
+        }
+    }
+
+    if let Some(value) = settings
+        .python_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        candidates.push(value.to_string());
+    }
+
+    if let Ok(env_python) = std::env::var("GHOSTMIC_PYTHON") {
+        if !env_python.trim().is_empty() {
+            candidates.push(env_python);
+        }
+    }
+
+    candidates.extend(discover_local_venv_python_candidates(script_path));
+    candidates.push("python3".to_string());
+    candidates.push("python".to_string());
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut transcription_capable_fallback: Option<String> = None;
+    let mut missing_transcription_for: Vec<String> = Vec::new();
+    let mut missing_diarization_for: Vec<String> = Vec::new();
+
+    for candidate in candidates {
+        if !seen.insert(candidate.clone()) {
+            continue;
+        }
+
+        let Some(capabilities) = inspect_python_runtime(&candidate) else {
+            continue;
+        };
+
+        if diarization_enabled && capabilities.supports_diarization() {
             return Ok(candidate);
         }
+
+        if capabilities.supports_transcription() {
+            if transcription_capable_fallback.is_none() {
+                transcription_capable_fallback = Some(candidate.clone());
+            }
+
+            if diarization_enabled && !capabilities.supports_diarization() {
+                missing_diarization_for.push(candidate);
+            }
+            continue;
+        }
+
+        missing_transcription_for.push(candidate);
+    }
+
+    if let Some(candidate) = transcription_capable_fallback {
+        return Ok(candidate);
+    }
+
+    if !missing_transcription_for.is_empty() {
+        let preferred = missing_transcription_for
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "python3".to_string());
+        let install_hint = build_requirements_install_hint(script_path, &preferred);
+        return Err(format!(
+            "Python found but dependency `faster_whisper` is missing. {} Or set Settings -> Python path to a ready virtualenv Python.",
+            install_hint
+        ));
+    }
+
+    if diarization_enabled && !missing_diarization_for.is_empty() {
+        let preferred = missing_diarization_for
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "python3".to_string());
+        let install_hint = build_diarization_requirements_install_hint(script_path, &preferred);
+        return Err(format!(
+            "Diarization is enabled, but no Python runtime with `whisperx` + `pyannote.audio` was found. {} Or set Settings -> Diarization Python to a ready environment.",
+            install_hint
+        ));
     }
 
     Err(
         "Python executable not found. Set it in Settings -> Python path or install python3."
             .to_string(),
+    )
+}
+
+fn inspect_python_runtime(candidate: &str) -> Option<PythonRuntimeCapabilities> {
+    if Command::new(candidate).arg("--version").output().is_err() {
+        return None;
+    }
+
+    let script = r#"
+import importlib.util
+import json
+
+def has_spec(name):
+    try:
+        return importlib.util.find_spec(name) is not None
+    except ModuleNotFoundError:
+        return False
+    except Exception:
+        return False
+
+print(json.dumps({
+    "faster_whisper": has_spec("faster_whisper"),
+    "whisperx": has_spec("whisperx"),
+    "pyannote_audio": has_spec("pyannote.audio"),
+}))
+"#;
+
+    let output = Command::new(candidate)
+        .arg("-c")
+        .arg(script)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let parsed = serde_json::from_slice::<PythonRuntimeCapabilitiesJson>(&output.stdout).ok()?;
+
+    Some(PythonRuntimeCapabilities {
+        has_faster_whisper: parsed.faster_whisper,
+        has_whisperx: parsed.whisperx,
+        has_pyannote_audio: parsed.pyannote_audio,
+    })
+}
+
+fn discover_local_venv_python_candidates(script_path: &Path) -> Vec<String> {
+    let mut results: Vec<String> = Vec::new();
+    let mut roots: Vec<PathBuf> = Vec::new();
+
+    for ancestor in script_path.ancestors() {
+        roots.push(ancestor.to_path_buf());
+    }
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        for ancestor in current_dir.ancestors() {
+            roots.push(ancestor.to_path_buf());
+        }
+    }
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        for ancestor in exe_path.ancestors() {
+            roots.push(ancestor.to_path_buf());
+        }
+    }
+
+    let mut dedup: HashSet<PathBuf> = HashSet::new();
+    for root in roots {
+        if !dedup.insert(root.clone()) {
+            continue;
+        }
+
+        for env_dir in [
+            ".venv-diarization",
+            ".venv-whisperx",
+            ".venv-pyannote",
+            ".venv",
+        ] {
+            let unix_candidate = root.join(env_dir).join("bin").join("python3");
+            if unix_candidate.exists() {
+                results.push(unix_candidate.to_string_lossy().into_owned());
+            }
+
+            let win_candidate = root.join(env_dir).join("Scripts").join("python.exe");
+            if win_candidate.exists() {
+                results.push(win_candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    results
+}
+
+fn find_requirements_file(script_path: &Path) -> Option<PathBuf> {
+    for ancestor in script_path.ancestors() {
+        let candidate = ancestor.join("Scripts").join("requirements.txt");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        for ancestor in current_dir.ancestors() {
+            let candidate = ancestor.join("Scripts").join("requirements.txt");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn build_requirements_install_hint(script_path: &Path, python_bin: &str) -> String {
+    if let Some(requirements) = find_requirements_file(script_path) {
+        return format!(
+            "Install dependencies with: \"{}\" -m pip install -r \"{}\"",
+            python_bin,
+            requirements.to_string_lossy()
+        );
+    }
+
+    format!(
+        "Install dependencies with: \"{}\" -m pip install -r Scripts/requirements.txt",
+        python_bin
+    )
+}
+
+fn find_diarization_requirements_file(script_path: &Path) -> Option<PathBuf> {
+    for ancestor in script_path.ancestors() {
+        let candidate = ancestor
+            .join("Scripts")
+            .join("requirements-diarization.txt");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        for ancestor in current_dir.ancestors() {
+            let candidate = ancestor
+                .join("Scripts")
+                .join("requirements-diarization.txt");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn build_diarization_requirements_install_hint(script_path: &Path, python_bin: &str) -> String {
+    if let Some(requirements) = find_diarization_requirements_file(script_path) {
+        return format!(
+            "Install diarization dependencies with: \"{}\" -m pip install -r \"{}\"",
+            python_bin,
+            requirements.to_string_lossy()
+        );
+    }
+
+    format!(
+        "Install diarization dependencies with: \"{}\" -m pip install -r Scripts/requirements-diarization.txt",
+        python_bin
     )
 }
 
@@ -1092,6 +1587,20 @@ fn build_shared_state(app: &tauri::App) -> Result<AppShared, String> {
         PersistedState::defaults()
     };
 
+    // Recover any stale processing jobs after app restart.
+    for job in &mut persisted.jobs {
+        if job.status == JobStatus::Processing {
+            job.status = JobStatus::Queued;
+            job.error_message =
+                Some("Recovered after app restart. Re-queued automatically.".to_string());
+            job.progress_percent = None;
+            job.progress_stage = None;
+            job.progress_eta_seconds = None;
+            job.processing_started_at = None;
+            job.is_paused = false;
+        }
+    }
+
     if persisted.settings.output_folder_path.trim().is_empty() {
         persisted.settings.output_folder_path =
             default_output_directory().to_string_lossy().into_owned();
@@ -1124,6 +1633,127 @@ fn build_shared_state(app: &tauri::App) -> Result<AppShared, String> {
     Ok(shared)
 }
 
+fn build_job_notice(core: &AppCore, meta_path: &str) -> Option<String> {
+    let metadata_text = fs::read_to_string(meta_path).ok()?;
+    let metadata = serde_json::from_str::<JobMetadata>(&metadata_text).ok()?;
+
+    if !metadata.diarization_requested || metadata.diarization_applied {
+        return None;
+    }
+
+    let mut message = String::from("Diarization was skipped.");
+    let fallback_event = metadata
+        .fallback_events
+        .iter()
+        .map(|event| event.trim())
+        .find(|event| !event.is_empty());
+
+    if let Some(event) = fallback_event {
+        message.push(' ');
+        if let Some(detail) = event.strip_prefix("whisperx unavailable: ") {
+            message.push_str("WhisperX failed: ");
+            message.push_str(detail.trim());
+        } else {
+            message.push_str(event);
+        }
+    } else if let Some(reason) = metadata
+        .diarization_fallback_reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        message.push(' ');
+        message.push_str(reason);
+    }
+
+    let missing_stack = metadata
+        .fallback_events
+        .iter()
+        .any(|event| event.contains("module not installed"));
+    if missing_stack {
+        message.push(' ');
+        message.push_str(
+            "Install whisperx + pyannote into a separate Python 3.11/3.12 env, then set Settings -> Diarization Python.",
+        );
+    }
+
+    let token_related = fallback_event.is_some_and(|event| {
+        let lower = event.to_ascii_lowercase();
+        lower.contains("hf token")
+            || lower.contains("gatedrepo")
+            || lower.contains("401")
+            || lower.contains("authentication token")
+    }) || metadata
+        .diarization_fallback_reason
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .contains("hf token");
+
+    if message.contains("HF token") || token_related {
+        message.push(' ');
+        message.push_str("Store the token in Settings -> Hugging Face token.");
+    }
+
+    if find_diarization_requirements_file(&core.script_path).is_some() && !message.ends_with('.') {
+        message.push('.');
+    }
+
+    Some(message)
+}
+
+fn compute_audio_to_processing_ratio(
+    duration_seconds: f64,
+    processing_elapsed_seconds: f64,
+) -> Option<f64> {
+    if !duration_seconds.is_finite()
+        || !processing_elapsed_seconds.is_finite()
+        || duration_seconds <= 0.0
+        || processing_elapsed_seconds <= 0.0
+    {
+        return None;
+    }
+
+    Some(duration_seconds / processing_elapsed_seconds)
+}
+
+fn persist_job_metrics_to_metadata(
+    meta_path: &str,
+    duration_seconds: f64,
+    processing_elapsed_seconds: f64,
+    audio_to_processing_ratio: Option<f64>,
+) {
+    let Ok(content) = fs::read_to_string(meta_path) else {
+        return;
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    object.insert(
+        "audio_duration_seconds".to_string(),
+        serde_json::Value::from(duration_seconds),
+    );
+    object.insert(
+        "processing_elapsed_seconds".to_string(),
+        serde_json::Value::from(processing_elapsed_seconds),
+    );
+    object.insert(
+        "audio_to_processing_ratio".to_string(),
+        match audio_to_processing_ratio {
+            Some(value) => serde_json::Value::from(value),
+            None => serde_json::Value::Null,
+        },
+    );
+
+    if let Ok(serialized) = serde_json::to_string_pretty(&value) {
+        let _ = fs::write(meta_path, serialized);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1143,6 +1773,8 @@ pub fn run() {
             retry_job,
             re_transcribe,
             cancel_job,
+            pause_job,
+            resume_job,
             delete_job,
             read_transcript,
             export_transcript,

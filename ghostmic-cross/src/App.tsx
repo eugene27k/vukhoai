@@ -22,10 +22,14 @@ interface ImportJob {
   output_txt_path?: string | null;
   meta_json_path?: string | null;
   error_message?: string | null;
+  notice_message?: string | null;
+  processing_elapsed_seconds?: number | null;
+  audio_to_processing_ratio?: number | null;
   progress_percent?: number | null;
   progress_stage?: string | null;
   progress_eta_seconds?: number | null;
   processing_started_at?: string | null;
+  is_paused?: boolean;
 }
 
 interface AppSettings {
@@ -34,6 +38,8 @@ interface AppSettings {
   diarization_enabled: boolean;
   output_folder_path: string;
   python_path?: string | null;
+  diarization_python_path?: string | null;
+  huggingface_token?: string | null;
   openai_model: string;
   openai_api_key?: string | null;
 }
@@ -226,6 +232,24 @@ function App() {
     }
   }
 
+  async function pauseJob(jobId: string) {
+    setErrorMessage("");
+    try {
+      await invoke("pause_job", { jobId });
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function resumeJob(jobId: string) {
+    setErrorMessage("");
+    try {
+      await invoke("resume_job", { jobId });
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   async function deleteJob(job: ImportJob) {
     const prompt =
       job.status === "processing"
@@ -353,7 +377,7 @@ function App() {
     <div className="app-shell">
       <header className="topbar">
         <div>
-          <h1>GhostMic Cross</h1>
+          <h1>Vukho.AI</h1>
           <p>Offline transcription (.m4a/.mp4) for macOS and Windows.</p>
         </div>
         <button onClick={openSettings}>Settings</button>
@@ -397,62 +421,86 @@ function App() {
         <div className="job-list">
           {filteredJobs.length === 0 && <p className="empty">No items yet.</p>}
 
-          {filteredJobs.map((job) => (
-            <article className="job-row" key={job.id}>
-              <div className="job-main">
-                <div className="job-title">{job.input_filename}</div>
-                <div className="job-meta">
-                  <span>{formatDate(job.created_at)}</span>
-                  <span>{durationText(job, liveTick)}</span>
-                  <span>{profileLabels[job.profile]}</span>
-                </div>
+          {filteredJobs.map((job) => {
+            const etaSeconds = estimatedEtaSeconds(job, liveTick);
 
-                {job.status === "processing" && (
-                  <div className="progress-wrap">
-                    <progress
-                      max={100}
-                      value={Math.max(0, Math.min(100, job.progress_percent ?? 0))}
-                    />
-                    <div className="progress-meta">
-                      <span>{Math.round(job.progress_percent ?? 0)}%</span>
-                      {job.progress_eta_seconds && job.progress_eta_seconds > 0 && (
-                        <span>ETA ~ {formatClock(job.progress_eta_seconds)}</span>
-                      )}
-                      {job.progress_stage && <span>{job.progress_stage}</span>}
-                    </div>
+            return (
+              <article className="job-row" key={job.id}>
+                <div className="job-main">
+                  <div className="job-title">{job.input_filename}</div>
+                  <div className="job-meta">
+                    <span>{formatDate(job.created_at)}</span>
+                    <span>{durationText(job, liveTick)}</span>
+                    {processingTimeText(job) && <span>{processingTimeText(job)}</span>}
+                    {processingRatioText(job) && <span>{processingRatioText(job)}</span>}
+                    <span>{profileLabels[job.profile]}</span>
                   </div>
-                )}
 
-                {job.error_message && (
-                  <div className="error-text">{job.error_message}</div>
-                )}
-              </div>
-
-              <div className="job-side">
-                <span className={`status ${job.status}`}>{job.status}</span>
-                <div className="actions">
-                  {job.status === "done" && (
-                    <>
-                      <button onClick={() => openTranscript(job.id)}>Open</button>
-                      <button onClick={() => reTranscribe(job.id)}>Re-transcribe</button>
-                    </>
+                  {job.status === "processing" && (
+                    <div className="progress-wrap">
+                      <progress
+                        max={100}
+                        value={Math.max(0, Math.min(100, job.progress_percent ?? 0))}
+                      />
+                      <div className="progress-meta">
+                        <span>{Math.round(job.progress_percent ?? 0)}%</span>
+                        {etaSeconds !== null && <span>ETA ~ {formatClock(etaSeconds)}</span>}
+                        {job.progress_stage && <span>{job.progress_stage}</span>}
+                      </div>
+                    </div>
                   )}
 
-                  {(job.status === "queued" || job.status === "processing") && (
-                    <button onClick={() => cancelJob(job.id)}>Cancel</button>
+                  {job.error_message && (
+                    <div className="error-text">{job.error_message}</div>
                   )}
-
-                  {(job.status === "failed" || job.status === "cancelled") && (
-                    <button onClick={() => retryJob(job.id)}>Retry</button>
+                  {job.notice_message && !job.error_message && (
+                    <div className="notice-text">{job.notice_message}</div>
                   )}
-
-                  <button className="danger" onClick={() => deleteJob(job)}>
-                    Delete
-                  </button>
                 </div>
-              </div>
-            </article>
-          ))}
+
+                <div className="job-side">
+                  <span
+                    className={`status ${job.status} ${
+                      job.status === "processing" && job.is_paused ? "paused" : ""
+                    }`}
+                  >
+                    {statusText(job)}
+                  </span>
+                  <div className="actions">
+                    {job.status === "done" && (
+                      <>
+                        <button onClick={() => openTranscript(job.id)}>Open</button>
+                        <button onClick={() => reTranscribe(job.id)}>Re-transcribe</button>
+                      </>
+                    )}
+
+                    {job.status === "queued" && (
+                      <button onClick={() => cancelJob(job.id)}>Cancel</button>
+                    )}
+
+                    {job.status === "processing" && (
+                      <>
+                        {job.is_paused ? (
+                          <button onClick={() => resumeJob(job.id)}>Resume</button>
+                        ) : (
+                          <button onClick={() => pauseJob(job.id)}>Pause</button>
+                        )}
+                        <button onClick={() => cancelJob(job.id)}>Cancel</button>
+                      </>
+                    )}
+
+                    {(job.status === "failed" || job.status === "cancelled") && (
+                      <button onClick={() => retryJob(job.id)}>Retry</button>
+                    )}
+
+                    <button className="danger" onClick={() => deleteJob(job)}>
+                      Delete
+                    </button>
+                  </div>
+                </div>
+              </article>
+            );
+          })}
         </div>
       </section>
 
@@ -586,6 +634,36 @@ function App() {
               </label>
 
               <label>
+                Diarization Python (optional)
+                <input
+                  type="text"
+                  value={settingsDraft.diarization_python_path ?? ""}
+                  onChange={(e) =>
+                    setSettingsDraft({
+                      ...settingsDraft,
+                      diarization_python_path: e.target.value,
+                    })
+                  }
+                  placeholder="Recommended: separate Python 3.11/3.12 env with whisperx + pyannote"
+                />
+              </label>
+
+              <label>
+                Hugging Face token (for pyannote)
+                <input
+                  type="password"
+                  value={settingsDraft.huggingface_token ?? ""}
+                  onChange={(e) =>
+                    setSettingsDraft({
+                      ...settingsDraft,
+                      huggingface_token: e.target.value,
+                    })
+                  }
+                  placeholder="Needed if pyannote models are not already cached"
+                />
+              </label>
+
+              <label>
                 OpenAI model (stored)
                 <input
                   type="text"
@@ -612,6 +690,11 @@ function App() {
                   }
                 />
               </label>
+            </div>
+
+            <div className="settings-note">
+              Speaker diarization needs a Python env with `whisperx` + `pyannote.audio`.
+              The app will auto-try `.venv-diarization`, but you can point to any ready env here.
             </div>
 
             {settingsStatus && <div className="banner ok">{settingsStatus}</div>}
@@ -650,6 +733,24 @@ function formatDate(value: string): string {
   return date.toLocaleString();
 }
 
+function processingTimeText(job: ImportJob): string | null {
+  const seconds = job.processing_elapsed_seconds;
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0) {
+    return null;
+  }
+
+  return `Processed in: ${formatClock(seconds)}`;
+}
+
+function processingRatioText(job: ImportJob): string | null {
+  const ratio = job.audio_to_processing_ratio;
+  if (typeof ratio !== "number" || !Number.isFinite(ratio) || ratio <= 0) {
+    return null;
+  }
+
+  return `Ratio: ${ratio.toFixed(2)}x`;
+}
+
 function durationText(job: ImportJob, liveTick: number): string {
   if (job.status === "processing" && job.processing_started_at) {
     const started = new Date(job.processing_started_at).getTime();
@@ -666,6 +767,42 @@ function durationText(job: ImportJob, liveTick: number): string {
   return "Duration: --";
 }
 
+function estimatedEtaSeconds(job: ImportJob, liveTick: number): number | null {
+  if (
+    typeof job.progress_eta_seconds === "number" &&
+    Number.isFinite(job.progress_eta_seconds) &&
+    job.progress_eta_seconds > 0
+  ) {
+    return job.progress_eta_seconds;
+  }
+
+  if (job.status !== "processing" || !job.processing_started_at) {
+    return null;
+  }
+
+  const percent = job.progress_percent ?? 0;
+  if (!Number.isFinite(percent) || percent <= 1 || percent >= 99.5) {
+    return null;
+  }
+
+  const started = new Date(job.processing_started_at).getTime();
+  if (Number.isNaN(started)) {
+    return null;
+  }
+
+  const elapsedSeconds = Math.max(0, (liveTick - started) / 1000);
+  if (!Number.isFinite(elapsedSeconds) || elapsedSeconds < 3) {
+    return null;
+  }
+
+  const estimatedRemaining = (elapsedSeconds * (100 - percent)) / percent;
+  if (!Number.isFinite(estimatedRemaining) || estimatedRemaining < 0) {
+    return null;
+  }
+
+  return estimatedRemaining;
+}
+
 function formatClock(inputSeconds: number): string {
   const total = Math.max(0, Math.floor(inputSeconds));
   const hours = Math.floor(total / 3600)
@@ -678,6 +815,13 @@ function formatClock(inputSeconds: number): string {
     .toString()
     .padStart(2, "0");
   return `${hours}:${minutes}:${seconds}`;
+}
+
+function statusText(job: ImportJob): string {
+  if (job.status === "processing" && job.is_paused) {
+    return "paused";
+  }
+  return job.status;
 }
 
 export default App;

@@ -1,4 +1,4 @@
-# GhostMic MVP
+# Vukho.AI MVP
 
 Локальний (офлайн) macOS застосунок для імпорту `.m4a/.mp4` і отримання TXT-транскрипції з таймкодами та спікерами.
 
@@ -97,28 +97,28 @@ export HF_TOKEN=ваш_токен
 
 ```bash
 swift build
-swift run GhostMic
+swift run VukhoAI
 ```
 
 Рекомендовано запускати так:
 
 ```bash
 source .venv/bin/activate
-swift run GhostMic
+swift run VukhoAI
 ```
 
 Якщо потрібно примусово вказати Python для app:
 
 ```bash
 export GHOSTMIC_PYTHON="/Users/admin/Documents/Development - Codex/GhostMic/.venv/bin/python3"
-swift run GhostMic
+swift run VukhoAI
 ```
 
 ---
 
 ## 3) Як користуватись (MVP flow)
 
-1. Відкрийте `GhostMic`.
+1. Відкрийте `Vukho.AI`.
 2. Додайте файл (`.m4a` або `.mp4`) через drag & drop або `Import File...`.
 3. Натисніть `Transcribe` (якщо файл уже є в списку, з'явиться підтвердження `Transcribe Anyway` / `Cancel`).
 4. Дочекайтесь зміни статусу: `queued` → `processing` → `done` або `failed`.
@@ -139,7 +139,7 @@ swift run GhostMic
 
 Відкрити `Settings` можна:
 - кнопкою `Settings` на головному екрані (відкриває модальне вікно в застосунку);
-- через меню macOS `GhostMic -> Settings...`;
+- через меню macOS `Vukho.AI -> Settings...`;
 - шорткатом `Cmd + ,`.
 
 В `Settings`:
@@ -173,7 +173,7 @@ cd "/Users/admin/Documents/Development - Codex/GhostMic"
 source .venv/bin/activate
 pip install -r Scripts/requirements.txt
 export GHOSTMIC_PYTHON="/Users/admin/Documents/Development - Codex/GhostMic/.venv/bin/python3"
-swift run GhostMic
+swift run VukhoAI
 ```
 
 Після цього в UI натисніть `Retry` на failed задачі.
@@ -196,7 +196,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r Scripts/requirements.txt
 export GHOSTMIC_PYTHON="/Users/admin/Documents/Development - Codex/GhostMic/.venv/bin/python3"
-swift run GhostMic
+swift run VukhoAI
 ```
 
 

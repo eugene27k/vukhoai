@@ -4,9 +4,11 @@ import argparse
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 PROFILE_TO_MODEL = {
@@ -35,6 +37,11 @@ def emit_progress(percent: float, stage: str, eta_seconds: Optional[float] = Non
     print("GHOSTMIC_PROGRESS " + json.dumps(payload, ensure_ascii=False), flush=True)
 
 
+def emit_notice(message: str) -> None:
+    payload = {"message": str(message or "").strip()}
+    print("GHOSTMIC_NOTICE " + json.dumps(payload, ensure_ascii=False), flush=True)
+
+
 def format_timestamp(seconds: float) -> str:
     value = max(seconds, 0.0)
     millis = int(round(value * 1000.0))
@@ -57,6 +64,157 @@ def write_txt(path: str, segments: List[Segment]) -> None:
             handle.write(line + "\n")
 
 
+def clean_text(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def safe_float(value: Any, fallback: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def infer_speaker_from_words(item: Dict[str, Any]) -> Optional[str]:
+    words = item.get("words")
+    if not isinstance(words, list):
+        return None
+
+    weights: Dict[str, float] = {}
+    for word in words:
+        if not isinstance(word, dict):
+            continue
+
+        speaker = word.get("speaker")
+        if not speaker:
+            continue
+
+        start = safe_float(word.get("start"))
+        end = safe_float(word.get("end"), start)
+        weight = max(end - start, 0.001)
+        weights[speaker] = weights.get(speaker, 0.0) + weight
+
+    if not weights:
+        return None
+
+    return max(weights, key=weights.get)
+
+
+def split_segment_by_speaker_runs(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    start = safe_float(item.get("start"))
+    end = safe_float(item.get("end"), start)
+    if end < start:
+        end = start
+
+    text = clean_text(item.get("text"))
+    words = item.get("words")
+    if not isinstance(words, list):
+        return [
+            {
+                "start": start,
+                "end": end,
+                "text": text,
+                "speaker": item.get("speaker") or infer_speaker_from_words(item),
+            }
+        ]
+
+    prepared_words: List[Dict[str, Any]] = []
+    for word in words:
+        if not isinstance(word, dict):
+            continue
+
+        token = clean_text(word.get("word") or word.get("text"))
+        if not token:
+            continue
+
+        word_start = safe_float(word.get("start"), start)
+        word_end = safe_float(word.get("end"), word_start)
+        if word_end < word_start:
+            word_end = word_start
+
+        prepared_words.append(
+            {
+                "start": word_start,
+                "end": word_end,
+                "text": token,
+                "speaker": word.get("speaker"),
+            }
+        )
+
+    if not prepared_words:
+        return [
+            {
+                "start": start,
+                "end": end,
+                "text": text,
+                "speaker": item.get("speaker") or infer_speaker_from_words(item),
+            }
+        ]
+
+    runs: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+    fallback_speaker = item.get("speaker") or infer_speaker_from_words(item)
+
+    for word in prepared_words:
+        speaker = word.get("speaker") or (current.get("speaker") if current else None) or fallback_speaker
+        if current and current.get("speaker") == speaker:
+            current["end"] = max(float(current["end"]), float(word["end"]))
+            current["text"] = f"{current['text']} {word['text']}".strip()
+            continue
+
+        if current:
+            runs.append(current)
+
+        current = {
+            "start": word["start"],
+            "end": word["end"],
+            "text": word["text"],
+            "speaker": speaker,
+        }
+
+    if current:
+        runs.append(current)
+
+    if not runs:
+        return [
+            {
+                "start": start,
+                "end": end,
+                "text": text,
+                "speaker": fallback_speaker,
+            }
+        ]
+
+    runs[0]["start"] = min(float(runs[0]["start"]), start)
+    runs[-1]["end"] = max(float(runs[-1]["end"]), end)
+    return runs
+
+
+def should_retry_whisperx(exc: Exception) -> bool:
+    message = f"{type(exc).__name__}: {exc}".lower()
+    return "badzipfile" in message or "file is not a zip file" in message
+
+
+def clear_silero_vad_cache() -> None:
+    hub_dir = Path.home() / ".cache" / "torch" / "hub"
+    targets = [
+        hub_dir / "master.zip",
+        hub_dir / "snakers4_silero-vad_master",
+        hub_dir / "trusted_list",
+    ]
+
+    for target in targets:
+        if not target.exists():
+            continue
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        else:
+            try:
+                target.unlink()
+            except OSError:
+                pass
+
+
 def normalize_segments(
     raw_segments: List[Dict[str, Any]],
     diarization_requested: bool,
@@ -69,6 +227,7 @@ def normalize_segments(
     normalized: List[Segment] = []
     speaker_map: Dict[str, str] = {}
     next_speaker_index = 1
+    segments_to_process: List[Dict[str, Any]] = []
 
     def speaker_label(raw: Optional[str]) -> str:
         nonlocal next_speaker_index
@@ -81,16 +240,24 @@ def normalize_segments(
         return speaker_map[raw]
 
     for item in raw_segments:
-        start = float(item.get("start") or 0.0)
-        end = float(item.get("end") or start)
+        if diarization_requested and diarization_applied:
+            segments_to_process.extend(split_segment_by_speaker_runs(item))
+        else:
+            segments_to_process.append(item)
+
+    for item in segments_to_process:
+        start = safe_float(item.get("start"))
+        end = safe_float(item.get("end"), start)
         if end < start:
             end = start
 
-        text = " ".join(str(item.get("text") or "").split())
+        text = clean_text(item.get("text"))
         if not text:
             continue
 
-        source_speaker = item.get("speaker") if (diarization_requested and diarization_applied) else None
+        source_speaker = None
+        if diarization_requested and diarization_applied:
+            source_speaker = item.get("speaker") or infer_speaker_from_words(item)
         speaker = speaker_label(source_speaker)
 
         if normalized and normalized[-1].speaker == speaker:
@@ -118,15 +285,20 @@ def transcribe_with_whisperx(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     import whisperx  # type: ignore
     import torch  # type: ignore
+    from whisperx.diarize import DiarizationPipeline  # type: ignore
 
     emit_progress(10, "Loading WhisperX model")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     compute_type = "float16" if device == "cuda" else "int8"
 
-    model = whisperx.load_model(model_name, device=device, compute_type=compute_type)
+    model = whisperx.load_model(
+        model_name,
+        device=device,
+        compute_type=compute_type,
+        vad_method="silero",
+    )
     transcribe_kwargs: Dict[str, Any] = {
         "batch_size": 8,
-        "vad_filter": True,
     }
     if language_mode == "uk":
         transcribe_kwargs["language"] = "uk"
@@ -139,6 +311,7 @@ def transcribe_with_whisperx(
     alignment_applied = False
     alignment_error: Optional[str] = None
     result_for_speakers: Dict[str, Any] = result
+    diarization_pipeline: Optional[Any] = None
 
     if detected_language and segments:
         try:
@@ -162,18 +335,30 @@ def transcribe_with_whisperx(
     diarization_error: Optional[str] = None
 
     if diarization_enabled:
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
         try:
-            emit_progress(75, "Applying diarization")
-            diarization_pipeline = whisperx.DiarizationPipeline(
-                use_auth_token=os.environ.get("HF_TOKEN"),
+            emit_progress(14, "Checking diarization readiness")
+            diarization_pipeline = DiarizationPipeline(
+                token=hf_token,
                 device=device,
             )
+        except Exception as exc:  # pragma: no cover - fallback path
+            diarization_error = f"{type(exc).__name__}: {exc}"
+            if not hf_token:
+                diarization_error += " Configure HF token if pyannote models are not already cached."
+            emit_notice(f"Diarization preflight failed. {diarization_error}")
+
+    if diarization_enabled and diarization_pipeline is not None:
+        try:
+            emit_progress(75, "Applying diarization")
             diarized = diarization_pipeline(audio_path)
             assigned = whisperx.assign_word_speakers(diarized, result_for_speakers)
             segments = assigned.get("segments", segments)
             diarization_applied = True
         except Exception as exc:  # pragma: no cover - fallback path
             diarization_error = f"{type(exc).__name__}: {exc}"
+            if not hf_token:
+                diarization_error += " Configure HF token if pyannote models are not already cached."
 
     meta = {
         "engine": "whisperx",
@@ -249,7 +434,7 @@ def transcribe_with_faster_whisper(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="GhostMic local transcription pipeline")
+    parser = argparse.ArgumentParser(description="Vukho.AI local transcription pipeline")
     parser.add_argument("--input", required=True, help="Path to input audio file")
     parser.add_argument("--output", required=True, help="Path to output TXT file")
     parser.add_argument("--meta", required=True, help="Path to metadata JSON file")
@@ -281,6 +466,7 @@ def main() -> int:
     raw_segments: List[Dict[str, Any]]
     engine_meta: Dict[str, Any]
     fallback_events: List[str] = []
+    whisperx_succeeded = False
 
     emit_progress(2, "Initializing")
 
@@ -294,23 +480,48 @@ def main() -> int:
                 language_mode=args.language,
                 diarization_enabled=diarization_requested,
             )
+            whisperx_succeeded = True
         except Exception as whisperx_error:
             fallback_events.append(f"whisperx unavailable: {type(whisperx_error).__name__}: {whisperx_error}")
-            emit_progress(6, "Falling back to faster-whisper")
-            try:
-                raw_segments, engine_meta = transcribe_with_faster_whisper(
-                    audio_path=args.input,
-                    model_name=model_name,
-                    language_mode=args.language,
-                    total_duration_seconds=total_duration_seconds,
+            if should_retry_whisperx(whisperx_error):
+                emit_notice("WhisperX cache looks corrupted. Retrying once after clearing cached Silero VAD files.")
+                clear_silero_vad_cache()
+                try:
+                    raw_segments, engine_meta = transcribe_with_whisperx(
+                        audio_path=args.input,
+                        model_name=model_name,
+                        language_mode=args.language,
+                        diarization_enabled=diarization_requested,
+                    )
+                    whisperx_succeeded = True
+                except Exception as retry_error:
+                    whisperx_error = retry_error
+                    fallback_events.append(
+                        f"whisperx unavailable after retry: {type(retry_error).__name__}: {retry_error}"
+                    )
+
+            if not whisperx_succeeded:
+                emit_notice(
+                    "WhisperX is unavailable for this run. Falling back to faster-whisper, so diarization will be skipped."
                 )
-            except Exception as fallback_error:
-                print("Transcription failed in both whisperx and faster-whisper.", file=sys.stderr)
-                print(f"whisperx error: {whisperx_error}", file=sys.stderr)
-                print(f"faster-whisper error: {fallback_error}", file=sys.stderr)
-                return 3
+                emit_progress(6, "Falling back to faster-whisper")
+                try:
+                    raw_segments, engine_meta = transcribe_with_faster_whisper(
+                        audio_path=args.input,
+                        model_name=model_name,
+                        language_mode=args.language,
+                        total_duration_seconds=total_duration_seconds,
+                    )
+                except Exception as fallback_error:
+                    print("Transcription failed in both whisperx and faster-whisper.", file=sys.stderr)
+                    print(f"whisperx error: {whisperx_error}", file=sys.stderr)
+                    print(f"faster-whisper error: {fallback_error}", file=sys.stderr)
+                    return 3
     else:
         fallback_events.append("whisperx unavailable: module not installed")
+        emit_notice(
+            "WhisperX is not installed in the selected diarization Python. Falling back to faster-whisper without diarization."
+        )
         try:
             raw_segments, engine_meta = transcribe_with_faster_whisper(
                 audio_path=args.input,
@@ -345,6 +556,7 @@ def main() -> int:
         "model": model_name,
         "language_mode": args.language,
         "segment_count": len(segments),
+        "speaker_count": len({segment.speaker for segment in segments}),
         "diarization_requested": diarization_requested,
         "diarization_applied": diarization_applied,
         "diarization_fallback_reason": diarization_fallback_reason,

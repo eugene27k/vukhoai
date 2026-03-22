@@ -16,7 +16,7 @@ struct GhostMicApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("GhostMic") {
+        WindowGroup("Vukho.AI") {
             MainView()
                 .environmentObject(settings)
                 .environmentObject(jobStore)

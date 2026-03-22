@@ -220,6 +220,13 @@ progress {
   white-space: pre-wrap;
 }
 
+.notice-text {
+  margin-top: 8px;
+  color: #ffd48d;
+  font-size: 0.88rem;
+  white-space: pre-wrap;
+}
+
 .job-side {
   min-width: 205px;
   display: grid;
@@ -244,6 +251,11 @@ progress {
 .status.processing {
   background: rgba(23, 69, 108, 0.75);
   border-color: rgba(110, 177, 238, 0.5);
+}
+
+.status.paused {
+  background: rgba(96, 72, 28, 0.78);
+  border-color: rgba(228, 186, 95, 0.58);
 }
 
 .status.failed,
@@ -377,6 +389,13 @@ progress {
   gap: 6px;
   font-size: 0.9rem;
   color: #c9deef;
+}
+
+.settings-note {
+  margin-top: 12px;
+  color: #9bb9cd;
+  font-size: 0.85rem;
+  line-height: 1.5;
 }
 
 .path-row {

@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "GhostMic",
+    name: "VukhoAI",
     platforms: [
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "GhostMic", targets: ["GhostMicApp"])
+        .executable(name: "VukhoAI", targets: ["GhostMicApp"])
     ],
     targets: [
         .executableTarget(

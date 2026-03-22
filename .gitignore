@@ -3,5 +3,7 @@
 DerivedData/
 .DS_Store
 .venv/
+.venv-diarization/
 
 Sources/GhostMicApp/Resources/__pycache__/
+ghostmic-cross/src-tauri/resources/__pycache__/

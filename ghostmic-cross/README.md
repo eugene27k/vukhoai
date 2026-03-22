@@ -1,4 +1,4 @@
-# GhostMic Cross (Tauri)
+# Vukho.AI (Tauri)
 
 Cross-platform desktop app (macOS + Windows target) for local/offline transcription using the existing `transcribe.py` pipeline.
 
@@ -8,7 +8,7 @@ Cross-platform desktop app (macOS + Windows target) for local/offline transcript
 - Queue processing (one job at a time)
 - Statuses: `queued`, `processing`, `done`, `failed`, `cancelled`
 - Real-time progress, stage, ETA
-- Cancel / Retry / Delete
+- Pause / Resume / Cancel / Retry / Delete
 - Re-transcribe from an existing finished item
 - Transcript viewer with toggles:
   - show/hide speakers
@@ -20,6 +20,8 @@ Cross-platform desktop app (macOS + Windows target) for local/offline transcript
   - diarization on/off
   - output folder
   - optional Python path
+  - optional diarization Python path
+  - optional Hugging Face token for pyannote
   - stored OpenAI fields (for future protocol feature in this app)
 
 ## Current limitation
@@ -40,6 +42,23 @@ source .venv/bin/activate
 pip install -r Scripts/requirements.txt
 ```
 
+Optional for real speaker diarization (`whisperx` + `pyannote`):
+
+```bash
+cd ".."
+python3.11 -m venv .venv-diarization
+source .venv-diarization/bin/activate
+pip install -r Scripts/requirements-diarization.txt
+```
+
+Then open `Settings` in the app and set:
+- `Diarization Python` -> `/absolute/path/to/.venv-diarization/bin/python`
+- `Hugging Face token` -> your token for pyannote models if they are not already cached locally
+
+Notes:
+- `whisperx/pyannote` is typically more reliable on Python `3.11` or `3.12`.
+- If diarization stack is missing, transcription still completes, but the app now shows a warning that diarization was skipped.
+
 Optional for better `.mp4` normalization and duration probing:
 - `ffmpeg`
 - `ffprobe`
@@ -58,6 +77,13 @@ If Python is not auto-detected, set it in Settings (`Python path`) or via env:
 export GHOSTMIC_PYTHON="/absolute/path/to/python3"
 ```
 
+For diarization you can also point to a dedicated env:
+
+```bash
+export GHOSTMIC_DIARIZATION_PYTHON="/absolute/path/to/.venv-diarization/bin/python"
+export HF_TOKEN="your_hugging_face_token"
+```
+
 ## Build
 
 ```bash
@@ -72,3 +98,7 @@ Output artifacts are in:
 
 State and queue are stored in the app data directory as JSON (`state.json`) plus cache folders.
 
+## Sleep / restart behavior
+
+- If MacBook goes to sleep while transcription is running, the process pauses with the OS and continues after wake.
+- If app is restarted and a job was left in `processing`, it is automatically recovered to `queued` and continues.
