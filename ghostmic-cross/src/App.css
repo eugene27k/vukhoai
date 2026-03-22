@@ -43,6 +43,20 @@ select {
   align-items: flex-start;
 }
 
+.brand-block {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.brand-logo {
+  width: 60px;
+  height: 60px;
+  flex: 0 0 auto;
+  border-radius: 18px;
+  box-shadow: 0 10px 24px rgba(6, 10, 19, 0.34);
+}
+
 .topbar h1 {
   margin: 0;
   font-size: 1.8rem;

@@ -1,0 +1,53 @@
+<svg width="960" height="320" viewBox="0 0 960 320" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="120" y1="18" x2="848" y2="284" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#10263B"/>
+      <stop offset="1" stop-color="#09131E"/>
+    </linearGradient>
+    <linearGradient id="earGlow" x1="96" y1="58" x2="246" y2="245" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFD38A"/>
+      <stop offset="0.55" stop-color="#E79A4E"/>
+      <stop offset="1" stop-color="#8B4BFF"/>
+    </linearGradient>
+    <linearGradient id="earCore" x1="135" y1="86" x2="208" y2="227" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFF0D4"/>
+      <stop offset="1" stop-color="#F7BA72"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="16" y="16" width="928" height="288" rx="36" fill="url(#bg)"/>
+  <rect x="44" y="44" width="224" height="224" rx="52" fill="#0D1B2A"/>
+  <path
+    d="M156 77c-36.3 0-63 29.5-63 66.9 0 18.4 6.9 33 19.7 45.1 9.6 9 15.7 20.1 17.8 32.4l.8 6.1c1 6.8 6.8 12.1 13.8 12.1h8.2c8.1 0 14.8-6.5 14.8-14.6v-15.1c0-9.4 5.7-17.9 14.5-22.2 19.6-9 33-28.5 33-51.3C219.5 103.7 192 77 156 77Z"
+    fill="url(#earGlow)"
+  />
+  <path
+    d="M158.7 103.2c-17.6 0-31.6 14-31.6 31.1 0 9.8 4 16.6 12.6 23.8 6.2 5.3 9.8 12.5 9.8 20.7v12.5"
+    stroke="#0F1725"
+    stroke-width="16"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M158.7 103.2c-17.6 0-31.6 14-31.6 31.1 0 9.8 4 16.6 12.6 23.8 6.2 5.3 9.8 12.5 9.8 20.7v12.5"
+    stroke="url(#earCore)"
+    stroke-width="9"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M181.4 117.1c9.5 5.8 15.8 16.1 15.8 28.1 0 9.9-4.4 18.8-11.7 25"
+    stroke="#FFF2DB"
+    stroke-width="9"
+    stroke-linecap="round"
+  />
+  <path d="M145 226.8h21.8" stroke="#FFF0D8" stroke-width="9" stroke-linecap="round"/>
+
+  <text x="312" y="138" fill="#F5F8FB" font-size="80" font-weight="700" font-family="Inter, Arial, sans-serif">Vukho.AI</text>
+  <text x="312" y="194" fill="#A8C3D8" font-size="28" font-weight="500" font-family="Inter, Arial, sans-serif">
+    We hear everything, so you miss nothing.
+  </text>
+  <text x="312" y="236" fill="#FFD38A" font-size="26" font-weight="600" font-family="Inter, Arial, sans-serif">
+    GitHub-ready brand asset
+  </text>
+</svg>

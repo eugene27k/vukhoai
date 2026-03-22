@@ -1,5 +1,7 @@
 # Vukho.AI (Tauri)
 
+![Vukho.AI GitHub logo](../branding/vukhoai-github-logo.svg)
+
 Cross-platform desktop app (macOS + Windows target) for local/offline transcription using the existing `transcribe.py` pipeline.
 
 ## What is implemented

@@ -1,5 +1,7 @@
 # Vukho.AI MVP
 
+![Vukho.AI GitHub logo](branding/vukhoai-github-logo.svg)
+
 Локальний (офлайн) macOS застосунок для імпорту `.m4a/.mp4` і отримання TXT-транскрипції з таймкодами та спікерами.
 
 ## Cross-platform (macOS + Windows)

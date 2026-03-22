@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
+import earLogo from "./assets/vukho-ear-logo.svg";
 
 type JobStatus = "queued" | "processing" | "done" | "failed" | "cancelled";
 type Profile = "maximum_quality" | "balanced" | "fast_economy";
@@ -376,9 +377,12 @@ function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div>
-          <h1>Vukho.AI</h1>
-          <p>Offline transcription (.m4a/.mp4) for macOS and Windows.</p>
+        <div className="brand-block">
+          <img className="brand-logo" src={earLogo} alt="Vukho.AI ear logo" />
+          <div>
+            <h1>Vukho.AI</h1>
+            <p>Offline transcription (.m4a/.mp4) for macOS and Windows.</p>
+          </div>
         </div>
         <button onClick={openSettings}>Settings</button>
       </header>
