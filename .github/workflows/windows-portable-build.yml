@@ -1,0 +1,77 @@
+name: Windows Portable Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/windows-portable-build.yml"
+      - "Build Windows Portable.cmd"
+      - "Scripts/**"
+      - "ghostmic-cross/**"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: ghostmic-cross/package-lock.json
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Seed portable settings from repository secrets
+        run: |
+          $portableDir = Join-Path $PWD "ghostmic-cross\portable-build"
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+
+          $settings = @{
+            default_profile = "maximum_quality"
+            language_mode = "auto"
+            diarization_enabled = $true
+            output_folder_path = ""
+            python_path = $null
+            diarization_python_path = $null
+            huggingface_token = if ($env:PORTABLE_HUGGINGFACE_TOKEN) { $env:PORTABLE_HUGGINGFACE_TOKEN } else { $null }
+            openai_model = if ($env:PORTABLE_OPENAI_MODEL) { $env:PORTABLE_OPENAI_MODEL } else { "gpt-4o-mini" }
+            openai_api_key = if ($env:PORTABLE_OPENAI_API_KEY) { $env:PORTABLE_OPENAI_API_KEY } else { $null }
+          }
+
+          $state = @{
+            settings = $settings
+            jobs = @()
+          }
+
+          $state | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 (Join-Path $portableDir "portable-state.local.json")
+        env:
+          PORTABLE_HUGGINGFACE_TOKEN: ${{ secrets.PORTABLE_HUGGINGFACE_TOKEN }}
+          PORTABLE_OPENAI_API_KEY: ${{ secrets.PORTABLE_OPENAI_API_KEY }}
+          PORTABLE_OPENAI_MODEL: ${{ vars.PORTABLE_OPENAI_MODEL }}
+
+      - name: Build portable package
+        run: |
+          .\Scripts\build_windows_portable.ps1
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vukho.AI-Windows-Portable
+          path: ghostmic-cross/portable-build/windows/Vukho.AI-Windows-Portable
+          if-no-files-found: error
