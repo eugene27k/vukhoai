@@ -13,8 +13,13 @@ use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
-const JOBS_EVENT: &str = "ghostmic://jobs-updated";
-const SETTINGS_EVENT: &str = "ghostmic://settings-updated";
+const JOBS_EVENT: &str = "vukhoai://jobs-updated";
+const SETTINGS_EVENT: &str = "vukhoai://settings-updated";
+const STATE_SCHEMA_VERSION: u32 = 2;
+
+fn legacy_state_schema_version() -> u32 {
+    0
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -59,7 +64,7 @@ enum LanguageMode {
 
 impl Default for LanguageMode {
     fn default() -> Self {
-        Self::Auto
+        Self::Ukrainian
     }
 }
 
@@ -115,7 +120,7 @@ impl AppSettings {
     fn defaults() -> Self {
         Self {
             default_profile: TranscriptionProfile::MaximumQuality,
-            language_mode: LanguageMode::Auto,
+            language_mode: LanguageMode::Ukrainian,
             diarization_enabled: true,
             output_folder_path: default_output_directory().to_string_lossy().into_owned(),
             python_path: None,
@@ -129,6 +134,8 @@ impl AppSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedState {
+    #[serde(default = "legacy_state_schema_version")]
+    schema_version: u32,
     settings: AppSettings,
     jobs: Vec<ImportJob>,
 }
@@ -136,6 +143,7 @@ struct PersistedState {
 impl PersistedState {
     fn defaults() -> Self {
         Self {
+            schema_version: STATE_SCHEMA_VERSION,
             settings: AppSettings::defaults(),
             jobs: Vec::new(),
         }
@@ -261,6 +269,21 @@ fn update_settings(
     state: State<'_, AppShared>,
     payload: SettingsUpdate,
 ) -> Result<AppSettings, String> {
+    eprintln!(
+        "[settings] update requested: output_folder_path={:?}, has_hf_token={}, has_openai_key={}",
+        payload.output_folder_path,
+        payload
+            .huggingface_token
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty()),
+        payload
+            .openai_api_key
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    );
+
     let mut guard = state
         .core
         .worker
@@ -307,10 +330,14 @@ fn update_settings(
             .map(str::to_string),
     };
 
+    let updated = guard.persisted.settings.clone();
+    drop(guard);
+
     persist_state(&state.core)?;
     emit_full_state(&state.core);
 
-    Ok(guard.persisted.settings.clone())
+    eprintln!("[settings] update persisted successfully");
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -553,6 +580,53 @@ fn delete_job(state: State<'_, AppShared>, job_id: String) -> Result<(), String>
     };
 
     cleanup_job_files(&state.core, &job);
+    persist_state(&state.core)?;
+    emit_full_state(&state.core);
+
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_jobs(state: State<'_, AppShared>) -> Result<(), String> {
+    let mut to_cleanup: Vec<ImportJob> = Vec::new();
+
+    {
+        let mut guard = state
+            .core
+            .worker
+            .lock()
+            .map_err(|_| "Failed to lock state".to_string())?;
+
+        let active_job_id = guard.active_job_id.clone();
+
+        if let Some(job_id) = active_job_id.as_ref() {
+            guard.cancellation_requests.insert(job_id.clone());
+            guard.deletion_requests.insert(job_id.clone());
+            if let Some(child) = guard.active_child.clone() {
+                let _ = kill_child(child);
+            }
+        }
+
+        guard.persisted.jobs.retain(|job| {
+            let keep_active = active_job_id.as_deref() == Some(job.id.as_str());
+            if !keep_active {
+                to_cleanup.push(job.clone());
+            }
+            keep_active
+        });
+
+        guard
+            .cancellation_requests
+            .retain(|job_id| active_job_id.as_deref() == Some(job_id.as_str()));
+        guard
+            .deletion_requests
+            .retain(|job_id| active_job_id.as_deref() == Some(job_id.as_str()));
+    }
+
+    for job in &to_cleanup {
+        cleanup_job_files(&state.core, job);
+    }
+
     persist_state(&state.core)?;
     emit_full_state(&state.core);
 
@@ -978,7 +1052,10 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
 }
 
 fn apply_runtime_line(shared: &AppShared, job_id: &str, line: &str) -> bool {
-    if let Some(payload) = line.strip_prefix("GHOSTMIC_NOTICE ") {
+    if let Some(payload) = line
+        .strip_prefix("VUKHOAI_NOTICE ")
+        .or_else(|| line.strip_prefix("GHOSTMIC_NOTICE "))
+    {
         let parsed = serde_json::from_str::<NoticePayload>(payload);
         let Ok(notice) = parsed else {
             return false;
@@ -998,7 +1075,10 @@ fn apply_runtime_line(shared: &AppShared, job_id: &str, line: &str) -> bool {
         return true;
     }
 
-    let Some(payload) = line.strip_prefix("GHOSTMIC_PROGRESS ") else {
+    let Some(payload) = line
+        .strip_prefix("VUKHOAI_PROGRESS ")
+        .or_else(|| line.strip_prefix("GHOSTMIC_PROGRESS "))
+    else {
         return false;
     };
 
@@ -1158,6 +1238,12 @@ fn resolve_python_binary(
             candidates.push(value.to_string());
         }
 
+        if let Ok(env_python) = std::env::var("VUKHOAI_DIARIZATION_PYTHON") {
+            if !env_python.trim().is_empty() {
+                candidates.push(env_python);
+            }
+        }
+
         if let Ok(env_python) = std::env::var("GHOSTMIC_DIARIZATION_PYTHON") {
             if !env_python.trim().is_empty() {
                 candidates.push(env_python);
@@ -1172,6 +1258,12 @@ fn resolve_python_binary(
         .filter(|v| !v.is_empty())
     {
         candidates.push(value.to_string());
+    }
+
+    if let Ok(env_python) = std::env::var("VUKHOAI_PYTHON") {
+        if !env_python.trim().is_empty() {
+            candidates.push(env_python);
+        }
     }
 
     if let Ok(env_python) = std::env::var("GHOSTMIC_PYTHON") {
@@ -1414,10 +1506,30 @@ fn build_diarization_requirements_install_hint(script_path: &Path, python_bin: &
 }
 
 fn default_output_directory() -> PathBuf {
-    let base = dirs::document_dir()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    documents_directory().join("VukhoAI").join("Exports")
+}
 
-    base.join("GhostMic").join("Exports")
+fn legacy_default_output_directory() -> PathBuf {
+    documents_directory().join("GhostMic").join("Exports")
+}
+
+fn documents_directory() -> PathBuf {
+    dirs::document_dir()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+fn migrate_output_folder_path_if_needed(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return default_output_directory().to_string_lossy().into_owned();
+    }
+
+    let candidate = PathBuf::from(trimmed);
+    if candidate == legacy_default_output_directory() {
+        return default_output_directory().to_string_lossy().into_owned();
+    }
+
+    trimmed.to_string()
 }
 
 fn persist_state(core: &AppCore) -> Result<(), String> {
@@ -1587,6 +1699,8 @@ fn build_shared_state(app: &tauri::App) -> Result<AppShared, String> {
         PersistedState::defaults()
     };
 
+    migrate_persisted_state(&mut persisted);
+
     // Recover any stale processing jobs after app restart.
     for job in &mut persisted.jobs {
         if job.status == JobStatus::Processing {
@@ -1601,10 +1715,8 @@ fn build_shared_state(app: &tauri::App) -> Result<AppShared, String> {
         }
     }
 
-    if persisted.settings.output_folder_path.trim().is_empty() {
-        persisted.settings.output_folder_path =
-            default_output_directory().to_string_lossy().into_owned();
-    }
+    persisted.settings.output_folder_path =
+        migrate_output_folder_path_if_needed(&persisted.settings.output_folder_path);
 
     fs::create_dir_all(&persisted.settings.output_folder_path)
         .map_err(|e| format!("Unable to create output directory: {e}"))?;
@@ -1631,6 +1743,19 @@ fn build_shared_state(app: &tauri::App) -> Result<AppShared, String> {
 
     persist_state(&shared.core)?;
     Ok(shared)
+}
+
+fn migrate_persisted_state(persisted: &mut PersistedState) {
+    if persisted.schema_version < 2 {
+        if persisted.settings.language_mode == LanguageMode::Auto {
+            persisted.settings.language_mode = LanguageMode::Ukrainian;
+        }
+        persisted.schema_version = 2;
+    }
+
+    if persisted.schema_version < STATE_SCHEMA_VERSION {
+        persisted.schema_version = STATE_SCHEMA_VERSION;
+    }
 }
 
 fn build_job_notice(core: &AppCore, meta_path: &str) -> Option<String> {
@@ -1776,6 +1901,7 @@ pub fn run() {
             pause_job,
             resume_job,
             delete_job,
+            clear_jobs,
             read_transcript,
             export_transcript,
         ])

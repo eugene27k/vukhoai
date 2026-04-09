@@ -10,7 +10,7 @@ final class JobRepository {
         case step(String)
     }
 
-    private let queue = DispatchQueue(label: "GhostMic.JobRepository")
+    private let queue = DispatchQueue(label: "VukhoAI.JobRepository")
     private var db: OpaquePointer?
 
     init(databaseURL: URL) throws {
@@ -375,7 +375,7 @@ final class JobRepository {
             createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 5)),
             durationSeconds: sqlite3_column_type(statement, 6) == SQLITE_NULL ? nil : sqlite3_column_double(statement, 6),
             profile: TranscriptionProfile(rawValue: stringColumn(statement, index: 7) ?? "maximumQuality") ?? .maximumQuality,
-            languageMode: LanguageMode(rawValue: stringColumn(statement, index: 8) ?? "auto") ?? .auto,
+            languageMode: LanguageMode(rawValue: stringColumn(statement, index: 8) ?? "ukrainian") ?? .ukrainian,
             diarizationEnabled: sqlite3_column_int(statement, 9) == 1,
             outputTXTPath: stringColumn(statement, index: 10),
             metaJSONPath: stringColumn(statement, index: 11),

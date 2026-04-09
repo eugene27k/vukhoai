@@ -112,7 +112,7 @@ swift run VukhoAI
 Якщо потрібно примусово вказати Python для app:
 
 ```bash
-export GHOSTMIC_PYTHON="/Users/admin/Documents/Development - Codex/GhostMic/.venv/bin/python3"
+export VUKHOAI_PYTHON="/Users/admin/Documents/Development - Codex/GhostMic/.venv/bin/python3"
 swift run VukhoAI
 ```
 
@@ -159,7 +159,7 @@ swift run VukhoAI
 
 ## 5) Де зберігаються дані
 
-- SQLite БД черги та службові файли: `~/Library/Application Support/GhostMic/`
+- SQLite БД черги та службові файли: `~/Library/Application Support/VukhoAI/`
 - Експортовані TXT: папка з `Settings -> Output folder`
 
 ---
@@ -174,7 +174,7 @@ swift run VukhoAI
 cd "/Users/admin/Documents/Development - Codex/GhostMic"
 source .venv/bin/activate
 pip install -r Scripts/requirements.txt
-export GHOSTMIC_PYTHON="/Users/admin/Documents/Development - Codex/GhostMic/.venv/bin/python3"
+export VUKHOAI_PYTHON="/Users/admin/Documents/Development - Codex/GhostMic/.venv/bin/python3"
 swift run VukhoAI
 ```
 
@@ -197,7 +197,7 @@ cd "/Users/admin/Documents/Development - Codex/GhostMic"
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r Scripts/requirements.txt
-export GHOSTMIC_PYTHON="/Users/admin/Documents/Development - Codex/GhostMic/.venv/bin/python3"
+export VUKHOAI_PYTHON="/Users/admin/Documents/Development - Codex/GhostMic/.venv/bin/python3"
 swift run VukhoAI
 ```
 

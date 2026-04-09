@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 import earLogo from "./assets/vukho-ear-logo.svg";
 
@@ -52,8 +52,8 @@ interface AppSnapshot {
 
 type ListFilter = "all" | "completed_only";
 
-const JOBS_EVENT = "ghostmic://jobs-updated";
-const SETTINGS_EVENT = "ghostmic://settings-updated";
+const JOBS_EVENT = "vukhoai://jobs-updated";
+const SETTINGS_EVENT = "vukhoai://settings-updated";
 
 const profileLabels: Record<Profile, string> = {
   maximum_quality: "Maximum Quality",
@@ -62,7 +62,7 @@ const profileLabels: Record<Profile, string> = {
 };
 
 const languageLabels: Record<LanguageMode, string> = {
-  auto: "Auto",
+  auto: "Auto (retry Ukrainian if wrong)",
   ukrainian: "Force Ukrainian",
 };
 
@@ -77,6 +77,8 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState<AppSettings | null>(null);
   const [settingsStatus, setSettingsStatus] = useState<string>("");
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [clearingJobs, setClearingJobs] = useState(false);
 
   const [transcriptJobId, setTranscriptJobId] = useState<string | null>(null);
   const [showSpeakers, setShowSpeakers] = useState(true);
@@ -95,6 +97,11 @@ function App() {
     }
     return jobs;
   }, [jobs, listFilter]);
+
+  const hasQueuedOrProcessingJobs = useMemo(
+    () => jobs.some((job) => job.status === "queued" || job.status === "processing"),
+    [jobs],
+  );
 
   const loadInitialState = useCallback(async () => {
     const snapshot = await invoke<AppSnapshot>("get_state");
@@ -189,8 +196,12 @@ function App() {
     );
 
     if (duplicate) {
-      const accepted = window.confirm(
-        "This file (or filename) is already in the list. Transcribe anyway?",
+      const accepted = await confirm(
+        "This file or filename is already in the list. Transcribe anyway?",
+        {
+          title: "Duplicate Item",
+          kind: "warning",
+        },
       );
       if (!accepted) {
         return;
@@ -257,7 +268,12 @@ function App() {
         ? `Delete ${job.input_filename}? It will be cancelled and fully removed.`
         : `Delete ${job.input_filename}? This removes it from queue and list.`;
 
-    if (!window.confirm(prompt)) {
+    const accepted = await confirm(prompt, {
+      title: "Delete Transcription",
+      kind: "warning",
+    });
+
+    if (!accepted) {
       return;
     }
 
@@ -269,6 +285,37 @@ function App() {
       }
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function clearJobs() {
+    if (clearingJobs || jobs.length === 0) {
+      return;
+    }
+
+    const prompt = hasQueuedOrProcessingJobs
+      ? "Clear the entire queue and transcription list? Queued items will be removed, any active transcription will be cancelled, and generated files will be deleted."
+      : "Clear the entire transcription list? Generated transcript files and metadata will be deleted.";
+
+    const accepted = await confirm(prompt, {
+      title: "Clear List",
+      kind: "warning",
+    });
+
+    if (!accepted) {
+      return;
+    }
+
+    setErrorMessage("");
+    setClearingJobs(true);
+
+    try {
+      await invoke("clear_jobs");
+      closeTranscript();
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setClearingJobs(false);
     }
   }
 
@@ -355,22 +402,39 @@ function App() {
   }
 
   async function saveSettings() {
-    if (!settingsDraft) {
+    if (!settingsDraft || settingsSaving) {
       return;
     }
 
     setErrorMessage("");
-    setSettingsStatus("");
+    setSettingsStatus("Saving settings...");
+    setSettingsSaving(true);
 
     try {
-      const updated = await invoke<AppSettings>("update_settings", {
-        payload: settingsDraft,
-      });
+      const updated = await Promise.race([
+        invoke<AppSettings>("update_settings", {
+          payload: settingsDraft,
+        }),
+        new Promise<AppSettings>((_, reject) =>
+          window.setTimeout(
+            () =>
+              reject(
+                new Error(
+                  "Saving settings timed out after 10 seconds. Check the Tauri console for [settings] logs.",
+                ),
+              ),
+            10_000,
+          ),
+        ),
+      ]);
       setSettings(updated);
       setSettingsDraft(updated);
       setSettingsStatus("Settings saved.");
     } catch (error) {
+      setSettingsStatus("");
       setErrorMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSettingsSaving(false);
     }
   }
 
@@ -406,18 +470,23 @@ function App() {
       <section className="panel list-panel">
         <div className="list-header">
           <h2>Queue and Transcriptions</h2>
-          <div className="filters">
-            <button
-              className={listFilter === "all" ? "active" : ""}
-              onClick={() => setListFilter("all")}
-            >
-              All
-            </button>
-            <button
-              className={listFilter === "completed_only" ? "active" : ""}
-              onClick={() => setListFilter("completed_only")}
-            >
-              Completed only
+          <div className="list-header-actions">
+            <div className="filters">
+              <button
+                className={listFilter === "all" ? "active" : ""}
+                onClick={() => setListFilter("all")}
+              >
+                All
+              </button>
+              <button
+                className={listFilter === "completed_only" ? "active" : ""}
+                onClick={() => setListFilter("completed_only")}
+              >
+                Completed only
+              </button>
+            </div>
+            <button className="danger" onClick={clearJobs} disabled={clearingJobs || jobs.length === 0}>
+              {clearingJobs ? "Clearing..." : "Clear List"}
             </button>
           </div>
         </div>
@@ -586,8 +655,8 @@ function App() {
                     })
                   }
                 >
-                  <option value="auto">Auto</option>
                   <option value="ukrainian">Force Ukrainian</option>
+                  <option value="auto">Auto (retry Ukrainian if wrong)</option>
                 </select>
               </label>
 
@@ -704,8 +773,8 @@ function App() {
             {settingsStatus && <div className="banner ok">{settingsStatus}</div>}
 
             <div className="modal-actions">
-              <button className="primary" onClick={saveSettings}>
-                Save
+              <button className="primary" onClick={saveSettings} disabled={settingsSaving}>
+                {settingsSaving ? "Saving..." : "Save"}
               </button>
             </div>
           </div>

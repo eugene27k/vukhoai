@@ -76,13 +76,13 @@ npm run tauri dev
 If Python is not auto-detected, set it in Settings (`Python path`) or via env:
 
 ```bash
-export GHOSTMIC_PYTHON="/absolute/path/to/python3"
+export VUKHOAI_PYTHON="/absolute/path/to/python3"
 ```
 
 For diarization you can also point to a dedicated env:
 
 ```bash
-export GHOSTMIC_DIARIZATION_PYTHON="/absolute/path/to/.venv-diarization/bin/python"
+export VUKHOAI_DIARIZATION_PYTHON="/absolute/path/to/.venv-diarization/bin/python"
 export HF_TOKEN="your_hugging_face_token"
 ```
 
