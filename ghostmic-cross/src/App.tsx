@@ -25,6 +25,12 @@ interface ImportJob {
   meta_json_path?: string | null;
   error_message?: string | null;
   notice_message?: string | null;
+  runtime_engine?: string | null;
+  runtime_device?: string | null;
+  runtime_compute_type?: string | null;
+  runtime_gpu_active?: boolean | null;
+  runtime_fallback_reason?: string | null;
+  diarization_fallback_reason?: string | null;
   processing_elapsed_seconds?: number | null;
   audio_to_processing_ratio?: number | null;
   progress_percent?: number | null;
@@ -58,6 +64,7 @@ interface AppSnapshot {
 }
 
 type ListFilter = "all" | "completed_only";
+type RuntimeTone = "gpu" | "cpu" | "detecting";
 
 const JOBS_EVENT = "ghostmic://jobs-updated";
 const SETTINGS_EVENT = "ghostmic://settings-updated";
@@ -433,6 +440,18 @@ function App() {
     }
   }
 
+  async function copyFallbackReason(job: ImportJob) {
+    const text = buildFallbackReason(job);
+    if (!text) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      setErrorMessage("Unable to copy fallback reason to clipboard.");
+    }
+  }
+
   async function exportTranscript() {
     if (!transcriptJobId || !activeTranscriptJob) {
       return;
@@ -603,6 +622,8 @@ function App() {
 
           {filteredJobs.map((job) => {
             const etaSeconds = estimatedEtaSeconds(job, liveTick);
+            const runtimeIndicator = buildRuntimeIndicator(job);
+            const fallbackReason = buildFallbackReason(job);
 
             return (
               <article className="job-row" key={job.id}>
@@ -615,6 +636,20 @@ function App() {
                     {processingRatioText(job) && <span>{processingRatioText(job)}</span>}
                     <span>{profileLabels[job.profile]}</span>
                   </div>
+
+                  {runtimeIndicator && (
+                    <div
+                      className={`runtime-row ${runtimeIndicator.tone} ${
+                        runtimeIndicator.live ? "live" : ""
+                      }`}
+                    >
+                      <span className="runtime-dot" aria-hidden="true" />
+                      <span className="runtime-label">{runtimeIndicator.label}</span>
+                      {runtimeIndicator.detail && (
+                        <span className="runtime-detail">{runtimeIndicator.detail}</span>
+                      )}
+                    </div>
+                  )}
 
                   {job.status === "processing" && (
                     <div className="progress-wrap">
@@ -635,6 +670,17 @@ function App() {
                   )}
                   {job.notice_message && !job.error_message && (
                     <div className="notice-text">{job.notice_message}</div>
+                  )}
+                  {fallbackReason && (
+                    <div className="fallback-panel">
+                      <div className="fallback-header">
+                        <span>Fallback reason</span>
+                        <button type="button" className="fallback-copy" onClick={() => void copyFallbackReason(job)}>
+                          Copy reason
+                        </button>
+                      </div>
+                      <div className="fallback-text">{fallbackReason}</div>
+                    </div>
                   )}
                 </div>
 
@@ -1006,6 +1052,98 @@ function estimatedEtaSeconds(job: ImportJob, liveTick: number): number | null {
   }
 
   return estimatedRemaining;
+}
+
+function buildRuntimeIndicator(
+  job: ImportJob,
+): { tone: RuntimeTone; label: string; detail: string | null; live: boolean } | null {
+  const engine = cleanJobText(job.runtime_engine);
+  const computeType = cleanJobText(job.runtime_compute_type);
+  const live = job.status === "processing";
+  const detail = [engine, computeType].filter(Boolean).join(" · ") || null;
+
+  if (job.runtime_gpu_active === true || job.runtime_device === "cuda") {
+    return {
+      tone: "gpu",
+      label: "GPU active",
+      detail,
+      live,
+    };
+  }
+
+  if (job.runtime_gpu_active === false || job.runtime_device === "cpu") {
+    return {
+      tone: "cpu",
+      label: "CPU only",
+      detail,
+      live: false,
+    };
+  }
+
+  if (job.status === "processing") {
+    return {
+      tone: "detecting",
+      label: "Detecting runtime",
+      detail: engine,
+      live: false,
+    };
+  }
+
+  return detail
+    ? {
+        tone: "detecting",
+        label: "Runtime used",
+        detail,
+        live: false,
+      }
+    : null;
+}
+
+function buildFallbackReason(job: ImportJob): string | null {
+  const blocks: string[] = [];
+  const runtimeReason = cleanJobText(job.runtime_fallback_reason);
+  const diarizationReason = cleanJobText(job.diarization_fallback_reason);
+
+  if (runtimeReason) {
+    const runtimeContext = buildRuntimeContext(job);
+    blocks.push(
+      runtimeContext
+        ? `Transcription runtime: ${runtimeContext}\nReason: ${runtimeReason}`
+        : `Transcription runtime fallback:\n${runtimeReason}`,
+    );
+  }
+
+  if (diarizationReason) {
+    blocks.push(`Diarization fallback:\n${diarizationReason}`);
+  }
+
+  const uniqueBlocks = [...new Set(blocks)];
+  return uniqueBlocks.length > 0 ? uniqueBlocks.join("\n\n") : null;
+}
+
+function buildRuntimeContext(job: ImportJob): string | null {
+  const parts: string[] = [];
+  const engine = cleanJobText(job.runtime_engine);
+  const computeType = cleanJobText(job.runtime_compute_type);
+
+  if (engine) {
+    parts.push(engine);
+  }
+  if (job.runtime_gpu_active === true || job.runtime_device === "cuda") {
+    parts.push("GPU");
+  } else if (job.runtime_gpu_active === false || job.runtime_device === "cpu") {
+    parts.push("CPU");
+  }
+  if (computeType) {
+    parts.push(computeType);
+  }
+
+  return parts.length > 0 ? parts.join(" | ") : null;
+}
+
+function cleanJobText(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
 }
 
 function formatClock(inputSeconds: number): string {

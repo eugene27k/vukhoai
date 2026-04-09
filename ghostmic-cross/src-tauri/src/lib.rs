@@ -104,6 +104,12 @@ struct ImportJob {
     meta_json_path: Option<String>,
     error_message: Option<String>,
     notice_message: Option<String>,
+    runtime_engine: Option<String>,
+    runtime_device: Option<String>,
+    runtime_compute_type: Option<String>,
+    runtime_gpu_active: Option<bool>,
+    runtime_fallback_reason: Option<String>,
+    diarization_fallback_reason: Option<String>,
     processing_elapsed_seconds: Option<f64>,
     audio_to_processing_ratio: Option<f64>,
     progress_percent: Option<f64>,
@@ -218,6 +224,15 @@ struct NoticePayload {
     message: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct RuntimePayload {
+    engine: Option<String>,
+    device: Option<String>,
+    compute_type: Option<String>,
+    gpu_active: Option<bool>,
+    fallback_reason: Option<String>,
+}
+
 #[derive(Debug)]
 struct RunResult {
     exit_code: i32,
@@ -259,6 +274,11 @@ struct PythonRuntimeCapabilitiesJson {
 
 #[derive(Debug, Deserialize)]
 struct JobMetadata {
+    engine: Option<String>,
+    runtime_device: Option<String>,
+    runtime_compute_type: Option<String>,
+    runtime_gpu_active: Option<bool>,
+    runtime_fallback_reason: Option<String>,
     #[serde(default)]
     diarization_requested: bool,
     #[serde(default)]
@@ -400,6 +420,12 @@ fn enqueue_job(state: State<'_, AppShared>, input_path: String) -> Result<Import
         meta_json_path: None,
         error_message: None,
         notice_message: None,
+        runtime_engine: None,
+        runtime_device: None,
+        runtime_compute_type: None,
+        runtime_gpu_active: None,
+        runtime_fallback_reason: None,
+        diarization_fallback_reason: None,
         processing_elapsed_seconds: None,
         audio_to_processing_ratio: None,
         progress_percent: None,
@@ -435,6 +461,12 @@ fn retry_job(state: State<'_, AppShared>, job_id: String) -> Result<(), String> 
     job.status = JobStatus::Queued;
     job.error_message = None;
     job.notice_message = None;
+    job.runtime_engine = None;
+    job.runtime_device = None;
+    job.runtime_compute_type = None;
+    job.runtime_gpu_active = None;
+    job.runtime_fallback_reason = None;
+    job.diarization_fallback_reason = None;
     job.processing_elapsed_seconds = None;
     job.audio_to_processing_ratio = None;
     job.progress_percent = None;
@@ -492,6 +524,12 @@ fn cancel_job(state: State<'_, AppShared>, job_id: String) -> Result<(), String>
             job.status = JobStatus::Cancelled;
             job.error_message = Some("Cancelled by user.".to_string());
             job.notice_message = None;
+            job.runtime_engine = None;
+            job.runtime_device = None;
+            job.runtime_compute_type = None;
+            job.runtime_gpu_active = None;
+            job.runtime_fallback_reason = None;
+            job.diarization_fallback_reason = None;
             job.processing_elapsed_seconds = None;
             job.audio_to_processing_ratio = None;
             job.progress_percent = None;
@@ -811,6 +849,12 @@ fn worker_loop(shared: AppShared) {
                 job.status = JobStatus::Processing;
                 job.error_message = None;
                 job.notice_message = None;
+                job.runtime_engine = None;
+                job.runtime_device = None;
+                job.runtime_compute_type = None;
+                job.runtime_gpu_active = None;
+                job.runtime_fallback_reason = None;
+                job.diarization_fallback_reason = None;
                 job.processing_elapsed_seconds = None;
                 job.audio_to_processing_ratio = None;
                 job.progress_percent = Some(1.0);
@@ -857,6 +901,10 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
         Ok(result) if result.exit_code == 0 => build_job_notice(&shared.core, &result.meta_path),
         _ => None,
     };
+    let success_metadata = match &run_result {
+        Ok(result) if result.exit_code == 0 => read_job_metadata(&result.meta_path),
+        _ => None,
+    };
 
     {
         let mut guard = match shared.core.worker.lock() {
@@ -888,6 +936,9 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
                         job.meta_json_path = Some(result.meta_path.clone());
                         job.error_message = None;
                         job.notice_message = success_notice.clone();
+                        if let Some(metadata) = success_metadata.as_ref() {
+                            apply_job_metadata(job, metadata);
+                        }
                     } else {
                         let combined = format!(
                             "{}\n{}",
@@ -1130,6 +1181,50 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
 }
 
 fn apply_runtime_line(shared: &AppShared, job_id: &str, line: &str) -> bool {
+    if let Some(payload) = line
+        .strip_prefix("VUKHOAI_RUNTIME ")
+        .or_else(|| line.strip_prefix("GHOSTMIC_RUNTIME "))
+    {
+        let parsed = serde_json::from_str::<RuntimePayload>(payload);
+        let Ok(runtime) = parsed else {
+            return false;
+        };
+
+        if let Ok(mut guard) = shared.core.worker.lock() {
+            if let Some(job) = guard.persisted.jobs.iter_mut().find(|j| j.id == job_id) {
+                job.runtime_engine = runtime
+                    .engine
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                job.runtime_device = runtime
+                    .device
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                job.runtime_compute_type = runtime
+                    .compute_type
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                job.runtime_gpu_active = runtime.gpu_active;
+                job.runtime_fallback_reason = runtime
+                    .fallback_reason
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+            }
+        }
+
+        let _ = persist_state(&shared.core);
+        emit_full_state(&shared.core);
+        return true;
+    }
+
     if let Some(payload) = line
         .strip_prefix("VUKHOAI_NOTICE ")
         .or_else(|| line.strip_prefix("GHOSTMIC_NOTICE "))
@@ -1687,7 +1782,10 @@ fn discover_runtime_roots() -> Vec<PathBuf> {
     }
 
     let mut dedup: HashSet<PathBuf> = HashSet::new();
-    roots.into_iter().filter(|path| dedup.insert(path.clone())).collect()
+    roots
+        .into_iter()
+        .filter(|path| dedup.insert(path.clone()))
+        .collect()
 }
 
 fn resolve_portable_file(relative_candidates: &[&str]) -> Option<PathBuf> {
@@ -1722,9 +1820,7 @@ fn format_transcript(
     speaker_aliases: &BTreeMap<String, String>,
 ) -> String {
     raw.lines()
-        .map(|line| {
-            format_transcript_line(line, show_timestamps, show_speakers, speaker_aliases)
-        })
+        .map(|line| format_transcript_line(line, show_timestamps, show_speakers, speaker_aliases))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1861,10 +1957,8 @@ fn resolve_script_path(app: &tauri::App) -> Result<PathBuf, String> {
 }
 
 fn load_portable_state_seed() -> Option<PersistedState> {
-    let seed_path = resolve_portable_file(&[
-        PORTABLE_STATE_FILE_NAME,
-        "resources/portable-state.json",
-    ])?;
+    let seed_path =
+        resolve_portable_file(&[PORTABLE_STATE_FILE_NAME, "resources/portable-state.json"])?;
     let content = fs::read_to_string(seed_path).ok()?;
     let mut persisted = serde_json::from_str::<PersistedState>(&content).ok()?;
     persisted.jobs.clear();
@@ -1990,8 +2084,7 @@ fn migrate_persisted_state(persisted: &mut PersistedState) {
 }
 
 fn build_job_notice(core: &AppCore, meta_path: &str) -> Option<String> {
-    let metadata_text = fs::read_to_string(meta_path).ok()?;
-    let metadata = serde_json::from_str::<JobMetadata>(&metadata_text).ok()?;
+    let metadata = read_job_metadata(meta_path)?;
 
     if !metadata.diarization_requested || metadata.diarization_applied {
         return None;
@@ -2056,6 +2149,45 @@ fn build_job_notice(core: &AppCore, meta_path: &str) -> Option<String> {
     }
 
     Some(message)
+}
+
+fn read_job_metadata(meta_path: &str) -> Option<JobMetadata> {
+    let metadata_text = fs::read_to_string(meta_path).ok()?;
+    serde_json::from_str::<JobMetadata>(&metadata_text).ok()
+}
+
+fn apply_job_metadata(job: &mut ImportJob, metadata: &JobMetadata) {
+    job.runtime_engine = metadata
+        .engine
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    job.runtime_device = metadata
+        .runtime_device
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    job.runtime_compute_type = metadata
+        .runtime_compute_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    job.runtime_gpu_active = metadata.runtime_gpu_active;
+    job.runtime_fallback_reason = metadata
+        .runtime_fallback_reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    job.diarization_fallback_reason = metadata
+        .diarization_fallback_reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 }
 
 fn compute_audio_to_processing_ratio(

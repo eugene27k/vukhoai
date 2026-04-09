@@ -33,7 +33,9 @@ class Segment:
 class FasterWhisperRuntime:
     device: str
     compute_type: str
+    gpu_active: bool
     notice: Optional[str] = None
+    fallback_reason: Optional[str] = None
 
 
 def emit_progress(percent: float, stage: str, eta_seconds: Optional[float] = None) -> None:
@@ -50,6 +52,36 @@ def emit_progress(percent: float, stage: str, eta_seconds: Optional[float] = Non
 def emit_notice(message: str) -> None:
     payload = {"message": str(message or "").strip()}
     print("VUKHOAI_NOTICE " + json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def emit_runtime_state(
+    engine: str,
+    device: str,
+    compute_type: str,
+    gpu_active: bool,
+    fallback_reason: Optional[str] = None,
+) -> None:
+    payload: Dict[str, Any] = {
+        "engine": engine,
+        "device": device,
+        "compute_type": compute_type,
+        "gpu_active": bool(gpu_active),
+    }
+    if fallback_reason:
+        payload["fallback_reason"] = str(fallback_reason).strip()
+
+    print("VUKHOAI_RUNTIME " + json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+def combine_fallback_reasons(*reasons: Optional[str]) -> Optional[str]:
+    combined: List[str] = []
+    for reason in reasons:
+        value = str(reason or "").strip()
+        if value and value not in combined:
+            combined.append(value)
+    if not combined:
+        return None
+    return " ".join(combined)
 
 
 def format_timestamp(seconds: float) -> str:
@@ -246,7 +278,12 @@ def resolve_faster_whisper_runtime(profile: str) -> FasterWhisperRuntime:
         return FasterWhisperRuntime(
             device="cpu",
             compute_type="int8",
+            gpu_active=False,
             notice=f"CTranslate2 GPU probe is unavailable ({type(exc).__name__}). Using CPU transcription.",
+            fallback_reason=(
+                f"CTranslate2 GPU probe is unavailable ({type(exc).__name__}). "
+                "The selected Python runtime cannot use CUDA, so transcription is running on CPU."
+            ),
         )
 
     cuda_count = 0
@@ -256,7 +293,15 @@ def resolve_faster_whisper_runtime(profile: str) -> FasterWhisperRuntime:
         cuda_count = 0
 
     if cuda_count <= 0:
-        return FasterWhisperRuntime(device="cpu", compute_type="int8")
+        return FasterWhisperRuntime(
+            device="cpu",
+            compute_type="int8",
+            gpu_active=False,
+            fallback_reason=(
+                "CTranslate2 did not detect an NVIDIA CUDA device in the selected Python runtime. "
+                "Transcription is running on CPU."
+            ),
+        )
 
     supported_compute_types: set[str] = set()
     try:
@@ -268,7 +313,12 @@ def resolve_faster_whisper_runtime(profile: str) -> FasterWhisperRuntime:
         return FasterWhisperRuntime(
             device="cpu",
             compute_type="int8",
+            gpu_active=False,
             notice="CUDA GPU was detected, but CTranslate2 could not resolve a supported CUDA compute type. Falling back to CPU.",
+            fallback_reason=(
+                "CUDA GPU was detected, but CTranslate2 could not resolve a supported CUDA compute type. "
+                "Transcription is running on CPU."
+            ),
         )
 
     preferred = ["float16", "int8_float16", "int8", "float32", "int8_float32"]
@@ -280,12 +330,18 @@ def resolve_faster_whisper_runtime(profile: str) -> FasterWhisperRuntime:
         return FasterWhisperRuntime(
             device="cpu",
             compute_type="int8",
+            gpu_active=False,
             notice="CUDA GPU was detected, but no compatible CTranslate2 CUDA compute type was available. Falling back to CPU.",
+            fallback_reason=(
+                "CUDA GPU was detected, but no compatible CTranslate2 CUDA compute type was available. "
+                "Transcription is running on CPU."
+            ),
         )
 
     return FasterWhisperRuntime(
         device="cuda",
         compute_type=compute_type,
+        gpu_active=True,
         notice=f"Using NVIDIA CUDA acceleration for faster-whisper ({compute_type}).",
     )
 
@@ -364,6 +420,19 @@ def transcribe_with_whisperx(
     emit_progress(10, "Loading WhisperX model")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     compute_type = "float16" if device == "cuda" else "int8"
+    runtime_fallback_reason = None
+    if device != "cuda":
+        runtime_fallback_reason = (
+            "PyTorch CUDA is not available to the selected WhisperX runtime. "
+            "Transcription is running on CPU."
+        )
+    emit_runtime_state(
+        engine="whisperx",
+        device=device,
+        compute_type=compute_type,
+        gpu_active=device == "cuda",
+        fallback_reason=runtime_fallback_reason,
+    )
 
     model = whisperx.load_model(
         model_name,
@@ -450,6 +519,10 @@ def transcribe_with_whisperx(
 
     meta = {
         "engine": "whisperx",
+        "runtime_device": device,
+        "runtime_compute_type": compute_type,
+        "runtime_gpu_active": device == "cuda",
+        "runtime_fallback_reason": runtime_fallback_reason,
         "detected_language": detected_language,
         "language_retry_reason": language_retry_reason,
         "alignment_applied": alignment_applied,
@@ -466,10 +539,19 @@ def transcribe_with_faster_whisper(
     language_mode: str,
     total_duration_seconds: Optional[float],
     profile: str,
+    upstream_fallback_reason: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     from faster_whisper import WhisperModel  # type: ignore
 
     runtime = resolve_faster_whisper_runtime(profile)
+    runtime_fallback_reason = combine_fallback_reasons(upstream_fallback_reason, runtime.fallback_reason)
+    emit_runtime_state(
+        engine="faster-whisper",
+        device=runtime.device,
+        compute_type=runtime.compute_type,
+        gpu_active=runtime.gpu_active,
+        fallback_reason=runtime_fallback_reason,
+    )
     if runtime.notice:
         emit_notice(runtime.notice)
 
@@ -535,6 +617,8 @@ def transcribe_with_faster_whisper(
         "engine": "faster-whisper",
         "runtime_device": runtime.device,
         "runtime_compute_type": runtime.compute_type,
+        "runtime_gpu_active": runtime.gpu_active,
+        "runtime_fallback_reason": runtime_fallback_reason,
         "detected_language": detected_language,
         "language_retry_reason": language_retry_reason,
         "alignment_applied": False,
@@ -579,6 +663,7 @@ def main() -> int:
     engine_meta: Dict[str, Any]
     fallback_events: List[str] = []
     whisperx_succeeded = False
+    upstream_fallback_reason: Optional[str] = None
 
     emit_progress(2, "Initializing")
 
@@ -613,6 +698,10 @@ def main() -> int:
                     )
 
             if not whisperx_succeeded:
+                upstream_fallback_reason = (
+                    f"WhisperX failed ({type(whisperx_error).__name__}: {whisperx_error}). "
+                    "Falling back to faster-whisper, so diarization will be skipped."
+                )
                 emit_notice(
                     "WhisperX is unavailable for this run. Falling back to faster-whisper, so diarization will be skipped."
                 )
@@ -624,6 +713,7 @@ def main() -> int:
                         language_mode=args.language,
                         total_duration_seconds=total_duration_seconds,
                         profile=args.profile,
+                        upstream_fallback_reason=upstream_fallback_reason,
                     )
                 except Exception as fallback_error:
                     print("Transcription failed in both whisperx and faster-whisper.", file=sys.stderr)
@@ -632,6 +722,10 @@ def main() -> int:
                     return 3
     else:
         fallback_events.append("whisperx unavailable: module not installed")
+        upstream_fallback_reason = (
+            "WhisperX is not installed in the selected diarization Python. "
+            "Falling back to faster-whisper without diarization."
+        )
         emit_notice(
             "WhisperX is not installed in the selected diarization Python. Falling back to faster-whisper without diarization."
         )
@@ -642,6 +736,7 @@ def main() -> int:
                 language_mode=args.language,
                 total_duration_seconds=total_duration_seconds,
                 profile=args.profile,
+                upstream_fallback_reason=upstream_fallback_reason,
             )
         except Exception as fallback_error:
             print("Transcription failed in faster-whisper.", file=sys.stderr)
@@ -677,6 +772,8 @@ def main() -> int:
         "engine": engine_meta.get("engine"),
         "runtime_device": engine_meta.get("runtime_device"),
         "runtime_compute_type": engine_meta.get("runtime_compute_type"),
+        "runtime_gpu_active": engine_meta.get("runtime_gpu_active"),
+        "runtime_fallback_reason": engine_meta.get("runtime_fallback_reason"),
         "detected_language": engine_meta.get("detected_language"),
         "language_retry_reason": engine_meta.get("language_retry_reason"),
         "alignment_applied": bool(engine_meta.get("alignment_applied")),

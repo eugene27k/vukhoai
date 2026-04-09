@@ -443,6 +443,64 @@ button.danger {
   font-weight: 700;
 }
 
+.runtime-row {
+  margin-top: 10px;
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-muted);
+  font-size: 0.84rem;
+}
+
+.runtime-row.gpu {
+  border-color: rgba(242, 183, 5, 0.34);
+  background: rgba(242, 183, 5, 0.12);
+}
+
+.runtime-row.cpu {
+  border-color: rgba(255, 255, 255, 0.1);
+  background: rgba(17, 17, 17, 0.4);
+}
+
+.runtime-row.detecting {
+  border-style: dashed;
+}
+
+.runtime-dot {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 10px;
+  border-radius: 50%;
+  background: var(--color-text-muted);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.runtime-row.gpu .runtime-dot {
+  background: var(--color-primary);
+  box-shadow: 0 0 0 1px rgba(242, 183, 5, 0.22), 0 0 16px rgba(242, 183, 5, 0.44);
+}
+
+.runtime-row.cpu .runtime-dot {
+  background: var(--color-text-secondary);
+}
+
+.runtime-row.live.gpu .runtime-dot {
+  animation: runtime-pulse 1.2s ease-in-out infinite;
+}
+
+.runtime-label {
+  color: var(--color-text);
+  font-weight: 700;
+}
+
+.runtime-detail {
+  color: var(--color-text-secondary);
+}
+
 .progress-wrap {
   margin-top: 12px;
   padding: 12px;
@@ -510,6 +568,42 @@ progress::-moz-progress-bar {
   border-color: rgba(242, 183, 5, 0.28);
 }
 
+.fallback-panel {
+  margin-top: 10px;
+  padding: 12px;
+  border-radius: 16px;
+  border: 1px solid rgba(0, 87, 183, 0.22);
+  background: rgba(0, 87, 183, 0.1);
+}
+
+.fallback-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-text);
+}
+
+.fallback-copy {
+  min-height: auto;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 0.78rem;
+}
+
+.fallback-text {
+  margin-top: 10px;
+  white-space: pre-wrap;
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
 .job-side {
   min-width: 220px;
   display: grid;
@@ -559,6 +653,19 @@ progress::-moz-progress-bar {
   color: var(--color-primary-text);
   background: rgba(242, 183, 5, 0.18);
   border-color: rgba(242, 183, 5, 0.34);
+}
+
+@keyframes runtime-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 1px rgba(242, 183, 5, 0.22), 0 0 12px rgba(242, 183, 5, 0.34);
+    transform: scale(1);
+  }
+
+  50% {
+    box-shadow: 0 0 0 1px rgba(242, 183, 5, 0.28), 0 0 22px rgba(242, 183, 5, 0.62);
+    transform: scale(1.08);
+  }
 }
 
 .actions {
