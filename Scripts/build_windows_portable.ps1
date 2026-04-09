@@ -38,7 +38,7 @@ function Invoke-NativeCommand {
   & $FilePath @ArgumentList
   if ($LASTEXITCODE -ne 0) {
     $joinedArgs = ($ArgumentList | ForEach-Object { $_ }) -join " "
-    throw "Command failed with exit code $LASTEXITCODE: $FilePath $joinedArgs".Trim()
+    throw ("Command failed with exit code {0}: {1} {2}" -f $LASTEXITCODE, $FilePath, $joinedArgs).Trim()
   }
 }
 
