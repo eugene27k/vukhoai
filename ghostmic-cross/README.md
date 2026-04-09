@@ -96,6 +96,18 @@ npm run tauri build -- --debug
 Output artifacts are in:
 - `ghostmic-cross/src-tauri/target/debug/bundle/`
 
+## Windows regular-user flow
+
+If you just want a runnable Windows app and do not want to install Rust/Node/Python toolchains on that machine:
+
+- open the repository root on Windows
+- double-click `Build Windows Portable.cmd`
+
+That entrypoint now tries to download the latest ready-made portable Windows ZIP from GitHub Releases first. Only if no release is available does it fall back to a local source build.
+
+Detailed Windows packaging notes are in:
+- `ghostmic-cross/WINDOWS_PORTABLE_BUILD.md`
+
 ## Data storage
 
 State and queue are stored in the app data directory as JSON (`state.json`) plus cache folders.

@@ -9,6 +9,7 @@
 Додано окремий Tauri застосунок у папці `ghostmic-cross/`.
 
 - Документація запуску: [ghostmic-cross/README.md](ghostmic-cross/README.md)
+- Windows one-click path: double-click `Build Windows Portable.cmd` in the repo root. It first tries to download the latest ready-made Windows app from GitHub Releases and only falls back to local compilation if the Windows machine already has the toolchain installed.
 - Dev запуск:
 
 ```bash

@@ -49,13 +49,21 @@ Intentionally not included:
 
 The seed file is ignored by git.
 
-## 2. One-click local build
+## 2. One-click Windows app
 
 On Windows, double-click:
 
 `Build Windows Portable.cmd`
 
-What it does automatically:
+Default behavior:
+
+- tries to download the latest ready-to-run Windows ZIP from GitHub Releases
+- extracts it into `ghostmic-cross/portable-build/windows/`
+- opens the folder when done
+
+If no release ZIP is available yet, it falls back to a local source build only when the machine already has the required toolchain.
+
+What the local fallback does automatically:
 
 - exports current app settings into a portable first-run seed if local app state exists
 - creates `.venv`
@@ -69,13 +77,17 @@ What it does automatically:
   - bundled `.venv-diarization`
   - `portable-state.json` if settings were exported
 
-You can also run the PowerShell script directly:
+The ready-made release asset is published as:
+
+`Vukho.AI-Windows-Portable.zip`
+
+You can also run the bootstrap PowerShell script directly:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Scripts\build_windows_portable.ps1
+powershell -ExecutionPolicy Bypass -File .\Scripts\get_or_build_windows_portable.ps1
 ```
 
-Optional with ffmpeg sidecars:
+If you explicitly want to compile locally from source, run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Scripts\build_windows_portable.ps1 -FfmpegDir "C:\path\to\ffmpeg\bin"
@@ -87,20 +99,21 @@ Output:
 
 The resulting folder contains the app `.exe` plus everything the runtime can auto-discover.
 
-## 3. Automatic repository build
+## 3. Automatic repository build and release
 
-The repository also includes a GitHub Actions workflow:
+The repository includes GitHub Actions workflows that:
 
-`.github/workflows/windows-portable-build.yml`
+- build the Windows portable app
+- upload a workflow artifact
+- publish a stable release ZIP for regular users
 
-It builds the Windows portable artifact automatically on:
+The release asset name is:
 
-- manual `Run workflow`
-- push to `main`
+`Vukho.AI-Windows-Portable.zip`
 
-Artifact name:
+The stable release tag is:
 
-`Vukho.AI-Windows-Portable`
+`windows-portable-latest`
 
 ## 4. Optional repository secrets
 

@@ -2,7 +2,7 @@
 setlocal
 
 set "SCRIPT_DIR=%~dp0"
-set "PS_SCRIPT=%SCRIPT_DIR%Scripts\build_windows_portable.ps1"
+set "PS_SCRIPT=%SCRIPT_DIR%Scripts\get_or_build_windows_portable.ps1"
 
 if not exist "%PS_SCRIPT%" (
   echo.
@@ -13,8 +13,8 @@ if not exist "%PS_SCRIPT%" (
 )
 
 echo.
-echo Building Vukho.AI Windows portable package...
-echo This may take a while on the first run.
+echo Preparing Vukho.AI for Windows...
+echo The script will try to download a ready build first and only compile locally if needed.
 echo.
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%PS_SCRIPT%" -OpenFolder
