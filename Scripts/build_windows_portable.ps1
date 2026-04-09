@@ -29,6 +29,19 @@ function Require-Command {
   return $command.Source
 }
 
+function Invoke-NativeCommand {
+  param(
+    [string]$FilePath,
+    [string[]]$ArgumentList = @()
+  )
+
+  & $FilePath @ArgumentList
+  if ($LASTEXITCODE -ne 0) {
+    $joinedArgs = ($ArgumentList | ForEach-Object { $_ }) -join " "
+    throw "Command failed with exit code $LASTEXITCODE: $FilePath $joinedArgs".Trim()
+  }
+}
+
 function Resolve-PythonLauncher {
   $py = Get-Command py -ErrorAction SilentlyContinue
   if ($py) {
@@ -55,14 +68,14 @@ function Ensure-Venv {
   if (-not (Test-Path $venvPython)) {
     $launcherLeaf = [System.IO.Path]::GetFileNameWithoutExtension($PythonLauncher).ToLowerInvariant()
     if ($launcherLeaf -eq "py") {
-      & $PythonLauncher $VersionFlag -m venv $VenvPath
+      Invoke-NativeCommand -FilePath $PythonLauncher -ArgumentList @($VersionFlag, "-m", "venv", $VenvPath)
     } else {
-      & $PythonLauncher -m venv $VenvPath
+      Invoke-NativeCommand -FilePath $PythonLauncher -ArgumentList @("-m", "venv", $VenvPath)
     }
   }
 
-  & $venvPython -m pip install --upgrade pip setuptools wheel
-  & $venvPython -m pip install -r $RequirementsPath
+  Invoke-NativeCommand -FilePath $venvPython -ArgumentList @("-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel")
+  Invoke-NativeCommand -FilePath $venvPython -ArgumentList @("-m", "pip", "install", "-r", $RequirementsPath)
   return $venvPython
 }
 
@@ -86,7 +99,7 @@ $null = Require-Command -Name "npm" -Hint "Install Node.js 20+ first."
 $pythonLauncher = Resolve-PythonLauncher
 
 try {
-  & $pythonLauncher (Join-Path $repoRoot "Scripts\export_portable_state.py")
+  Invoke-NativeCommand -FilePath $pythonLauncher -ArgumentList @((Join-Path $repoRoot "Scripts\export_portable_state.py"))
 } catch {
   Write-Warning "Portable settings export was skipped: $($_.Exception.Message)"
 }
@@ -106,10 +119,10 @@ $null = Ensure-Venv `
 Push-Location $appRoot
 try {
   if (-not $SkipNpmInstall) {
-    npm install
+    Invoke-NativeCommand -FilePath "npm" -ArgumentList @("install")
   }
 
-  npm run tauri build -- --bundles none
+  Invoke-NativeCommand -FilePath "npm" -ArgumentList @("run", "tauri", "build", "--", "--no-bundle")
 }
 finally {
   Pop-Location
