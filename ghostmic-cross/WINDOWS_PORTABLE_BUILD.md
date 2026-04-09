@@ -49,29 +49,27 @@ Intentionally not included:
 
 The seed file is ignored by git.
 
-## 2. Prepare Windows Python runtimes
+## 2. One-click local build
 
-On the Windows build machine, create:
+On Windows, double-click:
 
-- `.venv`
-- `.venv-diarization`
+`Build Windows Portable.cmd`
 
-in the repository root if you want the portable package to run without manual Python configuration.
+What it does automatically:
 
-The app will auto-detect these folders when they are copied next to the `.exe`.
+- exports current app settings into a portable first-run seed if local app state exists
+- creates `.venv`
+- creates `.venv-diarization`
+- installs Python dependencies
+- runs the Tauri Windows build
+- creates a portable output folder with:
+  - the `.exe`
+  - `resources/transcribe.py`
+  - bundled `.venv`
+  - bundled `.venv-diarization`
+  - `portable-state.json` if settings were exported
 
-## 3. Optional: prepare ffmpeg sidecars
-
-If you want stronger `.mp4` support in the portable package, place:
-
-- `ffmpeg.exe`
-- `ffprobe.exe`
-
-in some folder and pass that folder to the build script.
-
-## 4. Build the portable Windows package
-
-Run this on Windows:
+You can also run the PowerShell script directly:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Scripts\build_windows_portable.ps1
@@ -88,6 +86,31 @@ Output:
 `ghostmic-cross/portable-build/windows/Vukho.AI-Windows-Portable/`
 
 The resulting folder contains the app `.exe` plus everything the runtime can auto-discover.
+
+## 3. Automatic repository build
+
+The repository also includes a GitHub Actions workflow:
+
+`.github/workflows/windows-portable-build.yml`
+
+It builds the Windows portable artifact automatically on:
+
+- manual `Run workflow`
+- push to `main`
+
+Artifact name:
+
+`Vukho.AI-Windows-Portable`
+
+## 4. Optional repository secrets
+
+If you want the downloaded GitHub Actions artifact to contain preseeded settings, configure:
+
+- `PORTABLE_HUGGINGFACE_TOKEN` as a GitHub secret
+- `PORTABLE_OPENAI_API_KEY` as a GitHub secret
+- `PORTABLE_OPENAI_MODEL` as a GitHub variable if you want a non-default model
+
+These values are injected into `portable-state.json` during the workflow build.
 
 ## 5. Important limitation
 

@@ -16,6 +16,7 @@ use uuid::Uuid;
 const JOBS_EVENT: &str = "ghostmic://jobs-updated";
 const SETTINGS_EVENT: &str = "ghostmic://settings-updated";
 const PORTABLE_STATE_FILE_NAME: &str = "portable-state.json";
+const STATE_SCHEMA_VERSION: u32 = 2;
 
 #[cfg(windows)]
 const FFMPEG_BINARY_NAME: &str = "ffmpeg.exe";
@@ -26,6 +27,10 @@ const FFMPEG_BINARY_NAME: &str = "ffmpeg";
 const FFPROBE_BINARY_NAME: &str = "ffprobe.exe";
 #[cfg(not(windows))]
 const FFPROBE_BINARY_NAME: &str = "ffprobe";
+
+fn legacy_state_schema_version() -> u32 {
+    0
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
