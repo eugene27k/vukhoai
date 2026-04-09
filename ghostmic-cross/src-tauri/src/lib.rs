@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -15,6 +15,17 @@ use uuid::Uuid;
 
 const JOBS_EVENT: &str = "ghostmic://jobs-updated";
 const SETTINGS_EVENT: &str = "ghostmic://settings-updated";
+const PORTABLE_STATE_FILE_NAME: &str = "portable-state.json";
+
+#[cfg(windows)]
+const FFMPEG_BINARY_NAME: &str = "ffmpeg.exe";
+#[cfg(not(windows))]
+const FFMPEG_BINARY_NAME: &str = "ffmpeg";
+
+#[cfg(windows)]
+const FFPROBE_BINARY_NAME: &str = "ffprobe.exe";
+#[cfg(not(windows))]
+const FFPROBE_BINARY_NAME: &str = "ffprobe";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -96,6 +107,8 @@ struct ImportJob {
     processing_started_at: Option<DateTime<Utc>>,
     #[serde(default)]
     is_paused: bool,
+    #[serde(default)]
+    speaker_aliases: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +260,12 @@ struct JobMetadata {
     fallback_events: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct TranscriptSpeaker {
+    label: String,
+    alias: String,
+}
+
 #[tauri::command]
 fn get_state(state: State<'_, AppShared>) -> AppSnapshot {
     let guard = state.core.worker.lock().expect("lock worker state");
@@ -307,10 +326,13 @@ fn update_settings(
             .map(str::to_string),
     };
 
+    let updated = guard.persisted.settings.clone();
+    drop(guard);
+
     persist_state(&state.core)?;
     emit_full_state(&state.core);
 
-    Ok(guard.persisted.settings.clone())
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -362,6 +384,7 @@ fn enqueue_job(state: State<'_, AppShared>, input_path: String) -> Result<Import
         progress_eta_seconds: None,
         processing_started_at: None,
         is_paused: false,
+        speaker_aliases: BTreeMap::new(),
     };
 
     guard.persisted.jobs.push(job.clone());
@@ -566,7 +589,7 @@ fn read_transcript(
     show_timestamps: bool,
     show_speakers: bool,
 ) -> Result<String, String> {
-    let output_path = {
+    let (output_path, speaker_aliases) = {
         let guard = state
             .core
             .worker
@@ -578,13 +601,72 @@ fn read_transcript(
         let Some(path) = &job.output_txt_path else {
             return Err("Transcript is not ready.".to_string());
         };
-        path.clone()
+        (path.clone(), job.speaker_aliases.clone())
     };
 
     let raw =
         fs::read_to_string(&output_path).map_err(|e| format!("Unable to read transcript: {e}"))?;
 
-    Ok(format_transcript(&raw, show_timestamps, show_speakers))
+    Ok(format_transcript(
+        &raw,
+        show_timestamps,
+        show_speakers,
+        &speaker_aliases,
+    ))
+}
+
+#[tauri::command]
+fn get_transcript_speakers(
+    state: State<'_, AppShared>,
+    job_id: String,
+) -> Result<Vec<TranscriptSpeaker>, String> {
+    let (output_path, speaker_aliases) = {
+        let guard = state
+            .core
+            .worker
+            .lock()
+            .map_err(|_| "Failed to lock state".to_string())?;
+        let Some(job) = guard.persisted.jobs.iter().find(|j| j.id == job_id) else {
+            return Err("Job not found.".to_string());
+        };
+        let Some(path) = &job.output_txt_path else {
+            return Err("Transcript is not ready.".to_string());
+        };
+        (path.clone(), job.speaker_aliases.clone())
+    };
+
+    let raw =
+        fs::read_to_string(&output_path).map_err(|e| format!("Unable to read transcript: {e}"))?;
+
+    Ok(extract_transcript_speakers(&raw, &speaker_aliases))
+}
+
+#[tauri::command]
+fn update_speaker_aliases(
+    state: State<'_, AppShared>,
+    job_id: String,
+    aliases: BTreeMap<String, String>,
+) -> Result<(), String> {
+    let mut guard = state
+        .core
+        .worker
+        .lock()
+        .map_err(|_| "Failed to lock state".to_string())?;
+
+    let Some(job) = guard.persisted.jobs.iter_mut().find(|j| j.id == job_id) else {
+        return Err("Job not found.".to_string());
+    };
+
+    let Some(_path) = &job.output_txt_path else {
+        return Err("Transcript is not ready.".to_string());
+    };
+
+    job.speaker_aliases = normalize_speaker_aliases(aliases);
+
+    drop(guard);
+    persist_state(&state.core)?;
+    emit_full_state(&state.core);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1083,7 +1165,7 @@ fn prepare_audio(normalized_dir: &Path, job: &ImportJob) -> Result<PreparedAudio
 
     let normalized_path = if extension == "mp4" {
         let target = normalized_dir.join(format!("{}.m4a", job.id));
-        let ffmpeg_result = Command::new("ffmpeg")
+        let ffmpeg_result = Command::new(resolve_runtime_binary(FFMPEG_BINARY_NAME))
             .arg("-y")
             .arg("-i")
             .arg(&job.input_path)
@@ -1110,7 +1192,7 @@ fn prepare_audio(normalized_dir: &Path, job: &ImportJob) -> Result<PreparedAudio
 }
 
 fn probe_duration_seconds(path: &Path) -> Option<f64> {
-    let output = Command::new("ffprobe")
+    let output = Command::new(resolve_runtime_binary(FFPROBE_BINARY_NAME))
         .arg("-v")
         .arg("error")
         .arg("-show_entries")
@@ -1481,50 +1563,156 @@ fn maybe_remove_file(path: Option<&str>) {
     }
 }
 
-fn format_transcript(raw: &str, show_timestamps: bool, show_speakers: bool) -> String {
+fn discover_runtime_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        for ancestor in exe_path.ancestors() {
+            roots.push(ancestor.to_path_buf());
+        }
+    }
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        for ancestor in current_dir.ancestors() {
+            roots.push(ancestor.to_path_buf());
+        }
+    }
+
+    let mut dedup: HashSet<PathBuf> = HashSet::new();
+    roots.into_iter().filter(|path| dedup.insert(path.clone())).collect()
+}
+
+fn resolve_portable_file(relative_candidates: &[&str]) -> Option<PathBuf> {
+    for root in discover_runtime_roots() {
+        for relative in relative_candidates {
+            let candidate = root.join(relative);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn resolve_runtime_binary(binary_name: &str) -> String {
+    if let Some(path) = resolve_portable_file(&[
+        binary_name,
+        &format!("tools/{binary_name}"),
+        &format!("bin/{binary_name}"),
+    ]) {
+        return path.to_string_lossy().into_owned();
+    }
+
+    binary_name.to_string()
+}
+
+fn format_transcript(
+    raw: &str,
+    show_timestamps: bool,
+    show_speakers: bool,
+    speaker_aliases: &BTreeMap<String, String>,
+) -> String {
     raw.lines()
-        .map(|line| format_transcript_line(line, show_timestamps, show_speakers))
+        .map(|line| {
+            format_transcript_line(line, show_timestamps, show_speakers, speaker_aliases)
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn format_transcript_line(line: &str, show_timestamps: bool, show_speakers: bool) -> String {
+fn format_transcript_line(
+    line: &str,
+    show_timestamps: bool,
+    show_speakers: bool,
+    speaker_aliases: &BTreeMap<String, String>,
+) -> String {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return String::new();
     }
 
-    if let Some(rest) = trimmed.strip_prefix('[') {
-        if let Some(close_idx) = rest.find(']') {
-            let timestamp_content = &rest[..close_idx];
-            let remainder = rest[close_idx + 1..].trim_start();
-
-            if let Some((speaker, text)) = remainder.split_once(':') {
-                let speaker_trimmed = speaker.trim();
-                let text_trimmed = text.trim();
-                if speaker_trimmed.starts_with("SPEAKER_") {
-                    match (show_timestamps, show_speakers) {
-                        (true, true) => {
-                            return format!(
-                                "[{timestamp_content}] {speaker_trimmed}: {text_trimmed}"
-                            );
-                        }
-                        (true, false) => {
-                            return format!("[{timestamp_content}] {text_trimmed}");
-                        }
-                        (false, true) => {
-                            return format!("{speaker_trimmed}: {text_trimmed}");
-                        }
-                        (false, false) => {
-                            return text_trimmed.to_string();
-                        }
-                    }
+    if let Some((timestamp_content, speaker, text)) = parse_timestamped_transcript_line(trimmed) {
+        if speaker.starts_with("SPEAKER_") {
+            let display_name = resolve_speaker_display_name(speaker, speaker_aliases);
+            match (show_timestamps, show_speakers) {
+                (true, true) => {
+                    return format!("[{timestamp_content}] {display_name}: {text}");
+                }
+                (true, false) => {
+                    return format!("[{timestamp_content}] {text}");
+                }
+                (false, true) => {
+                    return format!("{display_name}: {text}");
+                }
+                (false, false) => {
+                    return text.to_string();
                 }
             }
         }
     }
 
     trimmed.to_string()
+}
+
+fn parse_timestamped_transcript_line(line: &str) -> Option<(&str, &str, &str)> {
+    let rest = line.strip_prefix('[')?;
+    let close_idx = rest.find(']')?;
+    let timestamp_content = &rest[..close_idx];
+    let remainder = rest[close_idx + 1..].trim_start();
+    let (speaker, text) = remainder.split_once(':')?;
+    Some((timestamp_content, speaker.trim(), text.trim()))
+}
+
+fn normalize_speaker_aliases(aliases: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    aliases
+        .into_iter()
+        .filter_map(|(label, alias)| {
+            let normalized_label = label.trim();
+            let normalized_alias = alias.trim();
+            if !normalized_label.starts_with("SPEAKER_") || normalized_alias.is_empty() {
+                return None;
+            }
+            Some((normalized_label.to_string(), normalized_alias.to_string()))
+        })
+        .collect()
+}
+
+fn resolve_speaker_display_name(
+    speaker_label: &str,
+    speaker_aliases: &BTreeMap<String, String>,
+) -> String {
+    speaker_aliases
+        .get(speaker_label)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(speaker_label)
+        .to_string()
+}
+
+fn extract_transcript_speakers(
+    raw: &str,
+    speaker_aliases: &BTreeMap<String, String>,
+) -> Vec<TranscriptSpeaker> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut speakers = Vec::new();
+
+    for line in raw.lines() {
+        let Some((_, speaker, _)) = parse_timestamped_transcript_line(line.trim()) else {
+            continue;
+        };
+        if !speaker.starts_with("SPEAKER_") || !seen.insert(speaker.to_string()) {
+            continue;
+        }
+
+        speakers.push(TranscriptSpeaker {
+            label: speaker.to_string(),
+            alias: speaker_aliases.get(speaker).cloned().unwrap_or_default(),
+        });
+    }
+
+    speakers
 }
 
 fn resolve_script_path(app: &tauri::App) -> Result<PathBuf, String> {
@@ -1543,6 +1731,10 @@ fn resolve_script_path(app: &tauri::App) -> Result<PathBuf, String> {
         candidates.push(path);
     }
 
+    if let Some(path) = resolve_portable_file(&["resources/transcribe.py", "transcribe.py"]) {
+        candidates.push(path);
+    }
+
     candidates.push(manifest_dir.join("resources").join("transcribe.py"));
     candidates.push(
         manifest_dir
@@ -1558,6 +1750,51 @@ fn resolve_script_path(app: &tauri::App) -> Result<PathBuf, String> {
         .into_iter()
         .find(|p| p.exists())
         .ok_or_else(|| "transcribe.py resource was not found.".to_string())
+}
+
+fn load_portable_state_seed() -> Option<PersistedState> {
+    let seed_path = resolve_portable_file(&[
+        PORTABLE_STATE_FILE_NAME,
+        "resources/portable-state.json",
+    ])?;
+    let content = fs::read_to_string(seed_path).ok()?;
+    let mut persisted = serde_json::from_str::<PersistedState>(&content).ok()?;
+    persisted.jobs.clear();
+    Some(persisted)
+}
+
+fn ensure_output_directory(settings: &mut AppSettings) -> Result<(), String> {
+    let configured = settings.output_folder_path.trim();
+    let default_output = default_output_directory();
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if !configured.is_empty() {
+        candidates.push(PathBuf::from(configured));
+    }
+    if candidates
+        .iter()
+        .all(|candidate| candidate != &default_output)
+    {
+        candidates.push(default_output);
+    }
+
+    let mut last_error: Option<String> = None;
+    for candidate in candidates {
+        match fs::create_dir_all(&candidate) {
+            Ok(_) => {
+                settings.output_folder_path = candidate.to_string_lossy().into_owned();
+                return Ok(());
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    Err(format!(
+        "Unable to create output directory: {}",
+        last_error.unwrap_or_else(|| "unknown error".to_string())
+    ))
 }
 
 fn build_shared_state(app: &tauri::App) -> Result<AppShared, String> {
@@ -1583,6 +1820,8 @@ fn build_shared_state(app: &tauri::App) -> Result<AppShared, String> {
             .map_err(|e| format!("Unable to read state file: {e}"))?;
         serde_json::from_str::<PersistedState>(&content)
             .map_err(|e| format!("Unable to parse state file: {e}"))?
+    } else if let Some(seed) = load_portable_state_seed() {
+        seed
     } else {
         PersistedState::defaults()
     };
@@ -1601,13 +1840,7 @@ fn build_shared_state(app: &tauri::App) -> Result<AppShared, String> {
         }
     }
 
-    if persisted.settings.output_folder_path.trim().is_empty() {
-        persisted.settings.output_folder_path =
-            default_output_directory().to_string_lossy().into_owned();
-    }
-
-    fs::create_dir_all(&persisted.settings.output_folder_path)
-        .map_err(|e| format!("Unable to create output directory: {e}"))?;
+    ensure_output_directory(&mut persisted.settings)?;
 
     let script_path = resolve_script_path(app)?;
 
@@ -1776,6 +2009,8 @@ pub fn run() {
             pause_job,
             resume_job,
             delete_job,
+            get_transcript_speakers,
+            update_speaker_aliases,
             read_transcript,
             export_transcript,
         ])

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -8,6 +8,7 @@ import earLogo from "./assets/vukho-ear-logo.svg";
 type JobStatus = "queued" | "processing" | "done" | "failed" | "cancelled";
 type Profile = "maximum_quality" | "balanced" | "fast_economy";
 type LanguageMode = "auto" | "ukrainian";
+type ThemeMode = "dark" | "light";
 
 interface ImportJob {
   id: string;
@@ -31,6 +32,12 @@ interface ImportJob {
   progress_eta_seconds?: number | null;
   processing_started_at?: string | null;
   is_paused?: boolean;
+  speaker_aliases?: Record<string, string>;
+}
+
+interface TranscriptSpeaker {
+  label: string;
+  alias: string;
 }
 
 interface AppSettings {
@@ -54,6 +61,7 @@ type ListFilter = "all" | "completed_only";
 
 const JOBS_EVENT = "ghostmic://jobs-updated";
 const SETTINGS_EVENT = "ghostmic://settings-updated";
+const THEME_STORAGE_KEY = "ghostmic.theme_mode";
 
 const profileLabels: Record<Profile, string> = {
   maximum_quality: "Maximum Quality",
@@ -66,6 +74,15 @@ const languageLabels: Record<LanguageMode, string> = {
   ukrainian: "Force Ukrainian",
 };
 
+function resolveInitialThemeMode(): ThemeMode {
+  try {
+    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return stored === "light" ? "light" : "dark";
+  } catch {
+    return "dark";
+  }
+}
+
 function App() {
   const [jobs, setJobs] = useState<ImportJob[]>([]);
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -73,6 +90,7 @@ function App() {
   const [listFilter, setListFilter] = useState<ListFilter>("all");
   const [errorMessage, setErrorMessage] = useState<string>("");
   const [liveTick, setLiveTick] = useState<number>(Date.now());
+  const [themeMode, setThemeMode] = useState<ThemeMode>(resolveInitialThemeMode);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState<AppSettings | null>(null);
@@ -83,6 +101,8 @@ function App() {
   const [showTimestamps, setShowTimestamps] = useState(true);
   const [transcriptText, setTranscriptText] = useState("");
   const [transcriptLoading, setTranscriptLoading] = useState(false);
+  const [transcriptSpeakers, setTranscriptSpeakers] = useState<TranscriptSpeaker[]>([]);
+  const speakerAliasesSnapshotRef = useRef<string>("");
 
   const activeTranscriptJob = useMemo(
     () => jobs.find((job) => job.id === transcriptJobId) ?? null,
@@ -124,6 +144,22 @@ function App() {
     [],
   );
 
+  const loadTranscriptSpeakers = useCallback(async (jobId: string) => {
+    setErrorMessage("");
+    try {
+      const speakers = await invoke<TranscriptSpeaker[]>("get_transcript_speakers", {
+        jobId,
+      });
+      setTranscriptSpeakers(speakers);
+      speakerAliasesSnapshotRef.current = JSON.stringify(
+        Object.fromEntries(speakers.map((speaker) => [speaker.label, speaker.alias])),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setErrorMessage(message);
+    }
+  }, []);
+
   useEffect(() => {
     void loadInitialState();
 
@@ -153,11 +189,63 @@ function App() {
   }, [loadInitialState]);
 
   useEffect(() => {
+    document.documentElement.dataset.theme = themeMode;
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, themeMode);
+    } catch {
+      // Ignore storage write failures and keep the in-memory theme.
+    }
+  }, [themeMode]);
+
+  useEffect(() => {
     if (!transcriptJobId) {
       return;
     }
     void loadTranscript(transcriptJobId, showTimestamps, showSpeakers);
   }, [transcriptJobId, showTimestamps, showSpeakers, loadTranscript]);
+
+  useEffect(() => {
+    if (!transcriptJobId) {
+      setTranscriptSpeakers([]);
+      speakerAliasesSnapshotRef.current = "";
+      return;
+    }
+
+    void loadTranscriptSpeakers(transcriptJobId);
+  }, [transcriptJobId, loadTranscriptSpeakers]);
+
+  useEffect(() => {
+    if (!transcriptJobId || transcriptSpeakers.length === 0) {
+      return;
+    }
+
+    const aliases = Object.fromEntries(
+      transcriptSpeakers.map((speaker) => [speaker.label, speaker.alias]),
+    );
+    const serializedAliases = JSON.stringify(aliases);
+    if (serializedAliases === speakerAliasesSnapshotRef.current) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      const currentJobId = transcriptJobId;
+      void (async () => {
+        try {
+          await invoke("update_speaker_aliases", {
+            jobId: currentJobId,
+            aliases,
+          });
+          speakerAliasesSnapshotRef.current = serializedAliases;
+          await loadTranscript(currentJobId, showTimestamps, showSpeakers);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          setErrorMessage(message);
+        }
+      })();
+    }, 250);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [transcriptJobId, transcriptSpeakers, showTimestamps, showSpeakers, loadTranscript]);
 
   async function pickInputFile() {
     setErrorMessage("");
@@ -276,14 +364,18 @@ function App() {
     setShowSpeakers(true);
     setShowTimestamps(true);
     setTranscriptText("");
+    setTranscriptSpeakers([]);
+    speakerAliasesSnapshotRef.current = "";
     setTranscriptJobId(jobId);
-    await loadTranscript(jobId, true, true);
+    await Promise.all([loadTranscript(jobId, true, true), loadTranscriptSpeakers(jobId)]);
   }
 
   function closeTranscript() {
     setTranscriptJobId(null);
     setTranscriptText("");
     setTranscriptLoading(false);
+    setTranscriptSpeakers([]);
+    speakerAliasesSnapshotRef.current = "";
   }
 
   async function copyTranscript() {
@@ -324,6 +416,12 @@ function App() {
     }
   }
 
+  function updateTranscriptSpeakerAlias(label: string, alias: string) {
+    setTranscriptSpeakers((current) =>
+      current.map((speaker) => (speaker.label === label ? { ...speaker, alias } : speaker)),
+    );
+  }
+
   function openSettings() {
     if (settings) {
       setSettingsDraft(settings);
@@ -336,6 +434,10 @@ function App() {
     setSettingsOpen(false);
     setSettingsStatus("");
     setErrorMessage("");
+  }
+
+  function toggleTheme() {
+    setThemeMode((current) => (current === "dark" ? "light" : "dark"));
   }
 
   async function pickOutputFolder() {
@@ -384,7 +486,12 @@ function App() {
             <p>Offline transcription (.m4a/.mp4) for macOS and Windows.</p>
           </div>
         </div>
-        <button onClick={openSettings}>Settings</button>
+        <div className="topbar-actions">
+          <button className="theme-toggle" onClick={toggleTheme}>
+            {themeMode === "dark" ? "Light Theme" : "Dark Theme"}
+          </button>
+          <button onClick={openSettings}>Settings</button>
+        </div>
       </header>
 
       <section className="panel import-panel">
@@ -536,6 +643,31 @@ function App() {
                 Show timestamps
               </label>
             </div>
+
+            {transcriptSpeakers.length > 0 && (
+              <div className="speaker-editor">
+                <div className="speaker-editor-title">Speakers</div>
+                <div className="speaker-editor-note">
+                  Rename speakers here. Transcript preview and export will use these names.
+                </div>
+
+                <div className="speaker-editor-grid">
+                  {transcriptSpeakers.map((speaker) => (
+                    <label className="speaker-alias-row" key={speaker.label}>
+                      <span>{speaker.label}</span>
+                      <input
+                        type="text"
+                        value={speaker.alias}
+                        placeholder={`Leave empty to keep ${speaker.label}`}
+                        onChange={(e) =>
+                          updateTranscriptSpeakerAlias(speaker.label, e.target.value)
+                        }
+                      />
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
 
             <div className="transcript-body">
               {transcriptLoading ? "Loading..." : transcriptText || "Transcript is empty."}
