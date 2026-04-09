@@ -151,6 +151,14 @@ button.danger {
   gap: 10px;
 }
 
+.list-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .filters {
   display: inline-flex;
   background: rgba(4, 10, 16, 0.8);

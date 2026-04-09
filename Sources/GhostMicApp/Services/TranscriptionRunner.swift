@@ -50,7 +50,15 @@ enum TranscriptionRunner {
     }
 
     private static func resolvePythonExecutable() throws -> URL {
-        if let explicit = ProcessInfo.processInfo.environment["GHOSTMIC_PYTHON"], !explicit.isEmpty {
+        let environment = ProcessInfo.processInfo.environment
+        if let explicit = environment["VUKHOAI_PYTHON"], !explicit.isEmpty {
+            let url = URL(fileURLWithPath: explicit)
+            if FileManager.default.isExecutableFile(atPath: url.path) {
+                return url
+            }
+        }
+
+        if let explicit = environment["GHOSTMIC_PYTHON"], !explicit.isEmpty {
             let url = URL(fileURLWithPath: explicit)
             if FileManager.default.isExecutableFile(atPath: url.path) {
                 return url
@@ -130,8 +138,8 @@ final class TranscriptionExecution {
     private let process = Process()
     private let stdoutPipe = Pipe()
     private let stderrPipe = Pipe()
-    private let controlQueue = DispatchQueue(label: "GhostMic.TranscriptionExecution.Control")
-    private let ioQueue = DispatchQueue(label: "GhostMic.TranscriptionExecution.IO")
+    private let controlQueue = DispatchQueue(label: "VukhoAI.TranscriptionExecution.Control")
+    private let ioQueue = DispatchQueue(label: "VukhoAI.TranscriptionExecution.IO")
     private let onProgress: (TranscriptionProgressEvent) -> Void
 
     private var started = false
@@ -355,8 +363,8 @@ final class TranscriptionExecution {
     }
 
     private func parseProgress(from line: String) -> TranscriptionProgressEvent? {
-        let prefix = "GHOSTMIC_PROGRESS "
-        guard line.hasPrefix(prefix) else { return nil }
+        let prefixes = ["VUKHOAI_PROGRESS ", "GHOSTMIC_PROGRESS "]
+        guard let prefix = prefixes.first(where: { line.hasPrefix($0) }) else { return nil }
 
         let jsonString = String(line.dropFirst(prefix.count))
         guard let data = jsonString.data(using: .utf8),

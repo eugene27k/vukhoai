@@ -17,6 +17,9 @@ PROFILE_TO_MODEL = {
     "fast": "small",
 }
 
+EXPECTED_AUTO_LANGUAGES = {"uk"}
+UKRAINIAN_LANGUAGE = "uk"
+
 
 @dataclass
 class Segment:
@@ -24,6 +27,13 @@ class Segment:
     end: float
     speaker: str
     text: str
+
+
+@dataclass
+class FasterWhisperRuntime:
+    device: str
+    compute_type: str
+    notice: Optional[str] = None
 
 
 def emit_progress(percent: float, stage: str, eta_seconds: Optional[float] = None) -> None:
@@ -34,12 +44,12 @@ def emit_progress(percent: float, stage: str, eta_seconds: Optional[float] = Non
     if eta_seconds is not None and eta_seconds >= 0:
         payload["eta_seconds"] = float(eta_seconds)
 
-    print("GHOSTMIC_PROGRESS " + json.dumps(payload, ensure_ascii=False), flush=True)
+    print("VUKHOAI_PROGRESS " + json.dumps(payload, ensure_ascii=False), flush=True)
 
 
 def emit_notice(message: str) -> None:
     payload = {"message": str(message or "").strip()}
-    print("GHOSTMIC_NOTICE " + json.dumps(payload, ensure_ascii=False), flush=True)
+    print("VUKHOAI_NOTICE " + json.dumps(payload, ensure_ascii=False), flush=True)
 
 
 def format_timestamp(seconds: float) -> str:
@@ -195,6 +205,20 @@ def should_retry_whisperx(exc: Exception) -> bool:
     return "badzipfile" in message or "file is not a zip file" in message
 
 
+def should_retry_with_ukrainian(language_mode: str, detected_language: Optional[str]) -> bool:
+    if language_mode != "auto" or not detected_language:
+        return False
+    return detected_language.lower() not in EXPECTED_AUTO_LANGUAGES
+
+
+def wrong_language_notice(detected_language: Optional[str]) -> str:
+    actual = detected_language or "unknown"
+    return (
+        f"Auto language detection returned '{actual}', but Vukho.AI is configured for Ukrainian "
+        "transcription. Retrying once with Ukrainian forced to avoid wrong-language hallucinations."
+    )
+
+
 def clear_silero_vad_cache() -> None:
     hub_dir = Path.home() / ".cache" / "torch" / "hub"
     targets = [
@@ -213,6 +237,57 @@ def clear_silero_vad_cache() -> None:
                 target.unlink()
             except OSError:
                 pass
+
+
+def resolve_faster_whisper_runtime(profile: str) -> FasterWhisperRuntime:
+    try:
+        import ctranslate2  # type: ignore
+    except Exception as exc:
+        return FasterWhisperRuntime(
+            device="cpu",
+            compute_type="int8",
+            notice=f"CTranslate2 GPU probe is unavailable ({type(exc).__name__}). Using CPU transcription.",
+        )
+
+    cuda_count = 0
+    try:
+        cuda_count = int(ctranslate2.get_cuda_device_count())
+    except Exception:
+        cuda_count = 0
+
+    if cuda_count <= 0:
+        return FasterWhisperRuntime(device="cpu", compute_type="int8")
+
+    supported_compute_types: set[str] = set()
+    try:
+        supported_compute_types = set(ctranslate2.get_supported_compute_types("cuda", 0))
+    except Exception:
+        supported_compute_types = set()
+
+    if not supported_compute_types:
+        return FasterWhisperRuntime(
+            device="cpu",
+            compute_type="int8",
+            notice="CUDA GPU was detected, but CTranslate2 could not resolve a supported CUDA compute type. Falling back to CPU.",
+        )
+
+    preferred = ["float16", "int8_float16", "int8", "float32", "int8_float32"]
+    if profile == "fast":
+        preferred = ["int8_float16", "float16", "int8", "float32", "int8_float32"]
+
+    compute_type = next((item for item in preferred if item in supported_compute_types), None)
+    if not compute_type:
+        return FasterWhisperRuntime(
+            device="cpu",
+            compute_type="int8",
+            notice="CUDA GPU was detected, but no compatible CTranslate2 CUDA compute type was available. Falling back to CPU.",
+        )
+
+    return FasterWhisperRuntime(
+        device="cuda",
+        compute_type=compute_type,
+        notice=f"Using NVIDIA CUDA acceleration for faster-whisper ({compute_type}).",
+    )
 
 
 def normalize_segments(
@@ -285,7 +360,6 @@ def transcribe_with_whisperx(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     import whisperx  # type: ignore
     import torch  # type: ignore
-    from whisperx.diarize import DiarizationPipeline  # type: ignore
 
     emit_progress(10, "Loading WhisperX model")
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -301,13 +375,25 @@ def transcribe_with_whisperx(
         "batch_size": 8,
     }
     if language_mode == "uk":
-        transcribe_kwargs["language"] = "uk"
+        transcribe_kwargs["language"] = UKRAINIAN_LANGUAGE
 
     emit_progress(20, "Transcribing")
     result = model.transcribe(audio_path, **transcribe_kwargs)
     segments = result.get("segments", [])
 
-    detected_language = result.get("language") if language_mode == "auto" else "uk"
+    detected_language = result.get("language") if language_mode == "auto" else UKRAINIAN_LANGUAGE
+    language_retry_reason: Optional[str] = None
+    if should_retry_with_ukrainian(language_mode, detected_language):
+        original_language = detected_language
+        language_retry_reason = f"auto_detected_{original_language}_forced_uk"
+        emit_notice(wrong_language_notice(original_language))
+        emit_progress(22, "Retrying with Ukrainian")
+        retry_kwargs = dict(transcribe_kwargs)
+        retry_kwargs["language"] = UKRAINIAN_LANGUAGE
+        result = model.transcribe(audio_path, **retry_kwargs)
+        segments = result.get("segments", [])
+        detected_language = UKRAINIAN_LANGUAGE
+
     alignment_applied = False
     alignment_error: Optional[str] = None
     result_for_speakers: Dict[str, Any] = result
@@ -337,7 +423,9 @@ def transcribe_with_whisperx(
     if diarization_enabled:
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
         try:
-            emit_progress(14, "Checking diarization readiness")
+            from whisperx.diarize import DiarizationPipeline  # type: ignore
+
+            emit_progress(68, "Checking diarization readiness")
             diarization_pipeline = DiarizationPipeline(
                 token=hf_token,
                 device=device,
@@ -350,7 +438,7 @@ def transcribe_with_whisperx(
 
     if diarization_enabled and diarization_pipeline is not None:
         try:
-            emit_progress(75, "Applying diarization")
+            emit_progress(82, "Applying diarization")
             diarized = diarization_pipeline(audio_path)
             assigned = whisperx.assign_word_speakers(diarized, result_for_speakers)
             segments = assigned.get("segments", segments)
@@ -363,6 +451,7 @@ def transcribe_with_whisperx(
     meta = {
         "engine": "whisperx",
         "detected_language": detected_language,
+        "language_retry_reason": language_retry_reason,
         "alignment_applied": alignment_applied,
         "alignment_error": alignment_error,
         "diarization_applied": diarization_applied,
@@ -376,12 +465,17 @@ def transcribe_with_faster_whisper(
     model_name: str,
     language_mode: str,
     total_duration_seconds: Optional[float],
+    profile: str,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     from faster_whisper import WhisperModel  # type: ignore
 
+    runtime = resolve_faster_whisper_runtime(profile)
+    if runtime.notice:
+        emit_notice(runtime.notice)
+
     emit_progress(10, "Loading model")
-    model = WhisperModel(model_name, device="cpu", compute_type="int8")
-    language = None if language_mode == "auto" else "uk"
+    model = WhisperModel(model_name, device=runtime.device, compute_type=runtime.compute_type)
+    language = None if language_mode == "auto" else UKRAINIAN_LANGUAGE
 
     emit_progress(15, "Transcribing")
     generated_segments, info = model.transcribe(
@@ -390,6 +484,21 @@ def transcribe_with_faster_whisper(
         vad_filter=True,
         word_timestamps=True,
     )
+
+    detected_language = getattr(info, "language", None)
+    language_retry_reason: Optional[str] = None
+    if should_retry_with_ukrainian(language_mode, detected_language):
+        original_language = detected_language
+        language_retry_reason = f"auto_detected_{original_language}_forced_uk"
+        emit_notice(wrong_language_notice(original_language))
+        emit_progress(17, "Retrying with Ukrainian")
+        generated_segments, info = model.transcribe(
+            audio_path,
+            language=UKRAINIAN_LANGUAGE,
+            vad_filter=True,
+            word_timestamps=True,
+        )
+        detected_language = UKRAINIAN_LANGUAGE
 
     started_at = time.time()
     last_reported = 15.0
@@ -424,7 +533,10 @@ def transcribe_with_faster_whisper(
 
     meta = {
         "engine": "faster-whisper",
-        "detected_language": getattr(info, "language", None),
+        "runtime_device": runtime.device,
+        "runtime_compute_type": runtime.compute_type,
+        "detected_language": detected_language,
+        "language_retry_reason": language_retry_reason,
         "alignment_applied": False,
         "alignment_error": "Alignment unavailable without whisperx.",
         "diarization_applied": False,
@@ -511,6 +623,7 @@ def main() -> int:
                         model_name=model_name,
                         language_mode=args.language,
                         total_duration_seconds=total_duration_seconds,
+                        profile=args.profile,
                     )
                 except Exception as fallback_error:
                     print("Transcription failed in both whisperx and faster-whisper.", file=sys.stderr)
@@ -528,6 +641,7 @@ def main() -> int:
                 model_name=model_name,
                 language_mode=args.language,
                 total_duration_seconds=total_duration_seconds,
+                profile=args.profile,
             )
         except Exception as fallback_error:
             print("Transcription failed in faster-whisper.", file=sys.stderr)
@@ -561,7 +675,10 @@ def main() -> int:
         "diarization_applied": diarization_applied,
         "diarization_fallback_reason": diarization_fallback_reason,
         "engine": engine_meta.get("engine"),
+        "runtime_device": engine_meta.get("runtime_device"),
+        "runtime_compute_type": engine_meta.get("runtime_compute_type"),
         "detected_language": engine_meta.get("detected_language"),
+        "language_retry_reason": engine_meta.get("language_retry_reason"),
         "alignment_applied": bool(engine_meta.get("alignment_applied")),
         "alignment_error": engine_meta.get("alignment_error"),
         "fallback_events": fallback_events,
