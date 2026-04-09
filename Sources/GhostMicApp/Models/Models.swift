@@ -53,15 +53,15 @@ enum TranscriptionProfile: String, Codable, CaseIterable, Identifiable {
 }
 
 enum LanguageMode: String, Codable, CaseIterable, Identifiable {
-    case auto
     case ukrainian
+    case auto
 
     var id: String { rawValue }
 
     var displayName: String {
         switch self {
         case .auto:
-            return "Auto"
+            return "Auto (retry Ukrainian if wrong)"
         case .ukrainian:
             return "Force Ukrainian"
         }

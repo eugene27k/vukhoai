@@ -345,7 +345,7 @@ struct MainView: View {
                 let rawTranscript = try String(contentsOfFile: transcriptPath, encoding: .utf8)
                 let cleanedTranscript = cleanedTranscriptForProtocol(rawTranscript)
                 guard !cleanedTranscript.isEmpty else {
-                    throw NSError(domain: "GhostMic", code: 1, userInfo: [NSLocalizedDescriptionKey: "Transcript is empty."])
+                    throw NSError(domain: "VukhoAI", code: 1, userInfo: [NSLocalizedDescriptionKey: "Transcript is empty."])
                 }
 
                 let protocolMarkdown = try await OpenAIProtocolService.shared.generateMeetingProtocol(

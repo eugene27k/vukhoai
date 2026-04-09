@@ -343,6 +343,14 @@ button.danger {
   gap: 16px;
 }
 
+.list-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .filters {
   display: inline-flex;
   padding: 4px;
