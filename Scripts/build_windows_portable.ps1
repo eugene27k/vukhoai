@@ -7,6 +7,14 @@ Param(
 
 $ErrorActionPreference = "Stop"
 
+function Test-IsWindowsHost {
+  if (Get-Variable -Name "IsWindows" -ErrorAction SilentlyContinue) {
+    return [bool]$IsWindows
+  }
+
+  return $env:OS -eq "Windows_NT"
+}
+
 function Require-Command {
   param(
     [string]$Name,
@@ -69,7 +77,7 @@ $resourceRoot = Join-Path $portableRoot "resources"
 $mainRequirements = Join-Path $repoRoot "Scripts\requirements.txt"
 $diarizationRequirements = Join-Path $repoRoot "Scripts\requirements-diarization.txt"
 
-if (-not $IsWindows) {
+if (-not (Test-IsWindowsHost)) {
   throw "This script must be run on Windows."
 }
 
