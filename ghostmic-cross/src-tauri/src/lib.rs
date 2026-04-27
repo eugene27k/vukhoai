@@ -112,6 +112,8 @@ struct ImportJob {
     diarization_fallback_reason: Option<String>,
     processing_elapsed_seconds: Option<f64>,
     audio_to_processing_ratio: Option<f64>,
+    wall_elapsed_seconds: Option<f64>,
+    audio_to_wall_ratio: Option<f64>,
     progress_percent: Option<f64>,
     progress_stage: Option<String>,
     progress_eta_seconds: Option<f64>,
@@ -428,6 +430,8 @@ fn enqueue_job(state: State<'_, AppShared>, input_path: String) -> Result<Import
         diarization_fallback_reason: None,
         processing_elapsed_seconds: None,
         audio_to_processing_ratio: None,
+        wall_elapsed_seconds: None,
+        audio_to_wall_ratio: None,
         progress_percent: None,
         progress_stage: None,
         progress_eta_seconds: None,
@@ -469,6 +473,8 @@ fn retry_job(state: State<'_, AppShared>, job_id: String) -> Result<(), String> 
     job.diarization_fallback_reason = None;
     job.processing_elapsed_seconds = None;
     job.audio_to_processing_ratio = None;
+    job.wall_elapsed_seconds = None;
+    job.audio_to_wall_ratio = None;
     job.progress_percent = None;
     job.progress_stage = None;
     job.progress_eta_seconds = None;
@@ -532,6 +538,8 @@ fn cancel_job(state: State<'_, AppShared>, job_id: String) -> Result<(), String>
             job.diarization_fallback_reason = None;
             job.processing_elapsed_seconds = None;
             job.audio_to_processing_ratio = None;
+            job.wall_elapsed_seconds = None;
+            job.audio_to_wall_ratio = None;
             job.progress_percent = None;
             job.progress_stage = None;
             job.progress_eta_seconds = None;
@@ -857,6 +865,8 @@ fn worker_loop(shared: AppShared) {
                 job.diarization_fallback_reason = None;
                 job.processing_elapsed_seconds = None;
                 job.audio_to_processing_ratio = None;
+                job.wall_elapsed_seconds = None;
+                job.audio_to_wall_ratio = None;
                 job.progress_percent = Some(1.0);
                 job.progress_stage = Some("Preparing audio".to_string());
                 job.progress_eta_seconds = None;
@@ -879,20 +889,13 @@ fn worker_loop(shared: AppShared) {
 
 fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<RunResult, String>) {
     let mut removed_job: Option<ImportJob> = None;
+    let finished_at = Utc::now();
     let processing_metrics = match &run_result {
         Ok(result) => {
             let ratio = compute_audio_to_processing_ratio(
                 result.duration_seconds,
                 result.processing_elapsed_seconds,
             );
-            if result.exit_code == 0 {
-                persist_job_metrics_to_metadata(
-                    &result.meta_path,
-                    result.duration_seconds,
-                    result.processing_elapsed_seconds,
-                    ratio,
-                );
-            }
             Some((result.processing_elapsed_seconds, ratio))
         }
         Err(_) => None,
@@ -916,6 +919,17 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
         let should_delete = guard.deletion_requests.remove(job_id);
 
         if let Some(job) = guard.persisted.jobs.iter_mut().find(|j| j.id == job_id) {
+            let wall_metrics = match (&run_result, job.processing_started_at) {
+                (Ok(result), Some(started_at)) => {
+                    let elapsed_ms = (finished_at - started_at).num_milliseconds();
+                    let elapsed_seconds = (elapsed_ms as f64 / 1000.0).max(0.0);
+                    let ratio =
+                        compute_audio_to_processing_ratio(result.duration_seconds, elapsed_seconds);
+                    Some((elapsed_seconds, ratio))
+                }
+                _ => None,
+            };
+
             match run_result {
                 Ok(result) => {
                     job.normalized_audio_path = Some(result.normalized_path.clone());
@@ -923,6 +937,19 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
                     job.processing_elapsed_seconds = Some(result.processing_elapsed_seconds);
                     job.audio_to_processing_ratio =
                         processing_metrics.as_ref().and_then(|metrics| metrics.1);
+                    job.wall_elapsed_seconds = wall_metrics.as_ref().map(|metrics| metrics.0);
+                    job.audio_to_wall_ratio = wall_metrics.as_ref().and_then(|metrics| metrics.1);
+
+                    if result.exit_code == 0 {
+                        persist_job_metrics_to_metadata(
+                            &result.meta_path,
+                            result.duration_seconds,
+                            result.processing_elapsed_seconds,
+                            processing_metrics.as_ref().and_then(|metrics| metrics.1),
+                            wall_metrics.as_ref().map(|metrics| metrics.0),
+                            wall_metrics.as_ref().and_then(|metrics| metrics.1),
+                        );
+                    }
 
                     if should_delete {
                         // handled below after remove
@@ -969,6 +996,8 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
                         job.notice_message = None;
                         job.processing_elapsed_seconds = None;
                         job.audio_to_processing_ratio = None;
+                        job.wall_elapsed_seconds = None;
+                        job.audio_to_wall_ratio = None;
                     }
                 }
             }
@@ -2210,6 +2239,8 @@ fn persist_job_metrics_to_metadata(
     duration_seconds: f64,
     processing_elapsed_seconds: f64,
     audio_to_processing_ratio: Option<f64>,
+    wall_elapsed_seconds: Option<f64>,
+    audio_to_wall_ratio: Option<f64>,
 ) {
     let Ok(content) = fs::read_to_string(meta_path) else {
         return;
@@ -2232,6 +2263,20 @@ fn persist_job_metrics_to_metadata(
     object.insert(
         "audio_to_processing_ratio".to_string(),
         match audio_to_processing_ratio {
+            Some(value) => serde_json::Value::from(value),
+            None => serde_json::Value::Null,
+        },
+    );
+    object.insert(
+        "wall_elapsed_seconds".to_string(),
+        match wall_elapsed_seconds {
+            Some(value) => serde_json::Value::from(value),
+            None => serde_json::Value::Null,
+        },
+    );
+    object.insert(
+        "audio_to_wall_ratio".to_string(),
+        match audio_to_wall_ratio {
             Some(value) => serde_json::Value::from(value),
             None => serde_json::Value::Null,
         },

@@ -33,6 +33,8 @@ interface ImportJob {
   diarization_fallback_reason?: string | null;
   processing_elapsed_seconds?: number | null;
   audio_to_processing_ratio?: number | null;
+  wall_elapsed_seconds?: number | null;
+  audio_to_wall_ratio?: number | null;
   progress_percent?: number | null;
   progress_stage?: string | null;
   progress_eta_seconds?: number | null;
@@ -624,6 +626,8 @@ function App() {
             const etaSeconds = estimatedEtaSeconds(job, liveTick);
             const runtimeIndicator = buildRuntimeIndicator(job);
             const fallbackReason = buildFallbackReason(job);
+            const wallText = wallTimeText(job, liveTick);
+            const processText = processingTimeText(job);
 
             return (
               <article className="job-row" key={job.id}>
@@ -631,9 +635,9 @@ function App() {
                   <div className="job-title">{job.input_filename}</div>
                   <div className="job-meta">
                     <span>{formatDate(job.created_at)}</span>
-                    <span>{durationText(job, liveTick)}</span>
-                    {processingTimeText(job) && <span>{processingTimeText(job)}</span>}
-                    {processingRatioText(job) && <span>{processingRatioText(job)}</span>}
+                    <span>{audioDurationText(job)}</span>
+                    {wallText && <span>{wallText}</span>}
+                    {processText && <span>{processText}</span>}
                     <span>{profileLabels[job.profile]}</span>
                   </div>
 
@@ -990,32 +994,61 @@ function processingTimeText(job: ImportJob): string | null {
     return null;
   }
 
-  return `Processed in: ${formatClock(seconds)}`;
+  return `Process time: ${formatClock(seconds)}${ratioSuffix(job.audio_to_processing_ratio)}`;
 }
 
-function processingRatioText(job: ImportJob): string | null {
-  const ratio = job.audio_to_processing_ratio;
-  if (typeof ratio !== "number" || !Number.isFinite(ratio) || ratio <= 0) {
+function wallTimeText(job: ImportJob, liveTick: number): string | null {
+  const finishedSeconds = job.wall_elapsed_seconds;
+  if (
+    typeof finishedSeconds === "number" &&
+    Number.isFinite(finishedSeconds) &&
+    finishedSeconds > 0
+  ) {
+    return `Wall time: ${formatClock(finishedSeconds)}${ratioSuffix(job.audio_to_wall_ratio)}`;
+  }
+
+  if (job.status !== "processing" || !job.processing_started_at) {
     return null;
   }
 
-  return `Ratio: ${ratio.toFixed(2)}x`;
+  const started = new Date(job.processing_started_at).getTime();
+  if (Number.isNaN(started)) {
+    return null;
+  }
+
+  const elapsedSeconds = Math.max(0, Math.floor((liveTick - started) / 1000));
+  const ratio = computeRatio(job.duration_seconds, elapsedSeconds);
+  return `Wall time: ${formatClock(elapsedSeconds)}${ratioSuffix(ratio)}`;
 }
 
-function durationText(job: ImportJob, liveTick: number): string {
-  if (job.status === "processing" && job.processing_started_at) {
-    const started = new Date(job.processing_started_at).getTime();
-    if (!Number.isNaN(started)) {
-      const elapsedSec = Math.max(0, Math.floor((liveTick - started) / 1000));
-      return `Elapsed: ${formatClock(elapsedSec)}`;
-    }
-  }
-
+function audioDurationText(job: ImportJob): string {
   if (job.duration_seconds && Number.isFinite(job.duration_seconds) && job.duration_seconds > 0) {
-    return `Duration: ${formatClock(job.duration_seconds)}`;
+    return `Audio: ${formatClock(job.duration_seconds)}`;
   }
 
-  return "Duration: --";
+  return "Audio: --";
+}
+
+function ratioSuffix(ratio: number | null | undefined): string {
+  if (typeof ratio !== "number" || !Number.isFinite(ratio) || ratio <= 0) {
+    return "";
+  }
+
+  return ` (${ratio.toFixed(2)}x)`;
+}
+
+function computeRatio(durationSeconds: number | null | undefined, elapsedSeconds: number): number | null {
+  if (
+    typeof durationSeconds !== "number" ||
+    !Number.isFinite(durationSeconds) ||
+    durationSeconds <= 0 ||
+    !Number.isFinite(elapsedSeconds) ||
+    elapsedSeconds <= 0
+  ) {
+    return null;
+  }
+
+  return durationSeconds / elapsedSeconds;
 }
 
 function estimatedEtaSeconds(job: ImportJob, liveTick: number): number | null {
