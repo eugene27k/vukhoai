@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 import earLogo from "./assets/vukho-ear-logo.svg";
@@ -41,6 +42,14 @@ interface ImportJob {
   processing_started_at?: string | null;
   is_paused?: boolean;
   speaker_aliases?: Record<string, string>;
+  performance_log?: PerformanceLogEntry[];
+}
+
+interface PerformanceLogEntry {
+  at: string;
+  offset_seconds?: number | null;
+  kind: string;
+  message: string;
 }
 
 interface TranscriptSpeaker {
@@ -100,6 +109,7 @@ function App() {
   const [errorMessage, setErrorMessage] = useState<string>("");
   const [liveTick, setLiveTick] = useState<number>(Date.now());
   const [themeMode, setThemeMode] = useState<ThemeMode>(resolveInitialThemeMode);
+  const [dragActive, setDragActive] = useState(false);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState<AppSettings | null>(null);
@@ -108,6 +118,7 @@ function App() {
   const [clearingJobs, setClearingJobs] = useState(false);
 
   const [transcriptJobId, setTranscriptJobId] = useState<string | null>(null);
+  const [diagnosticsJobId, setDiagnosticsJobId] = useState<string | null>(null);
   const [showSpeakers, setShowSpeakers] = useState(true);
   const [showTimestamps, setShowTimestamps] = useState(true);
   const [transcriptText, setTranscriptText] = useState("");
@@ -118,6 +129,10 @@ function App() {
   const activeTranscriptJob = useMemo(
     () => jobs.find((job) => job.id === transcriptJobId) ?? null,
     [jobs, transcriptJobId],
+  );
+  const activeDiagnosticsJob = useMemo(
+    () => jobs.find((job) => job.id === diagnosticsJobId) ?? null,
+    [jobs, diagnosticsJobId],
   );
 
   const filteredJobs = useMemo(() => {
@@ -263,6 +278,102 @@ function App() {
     return () => window.clearTimeout(timeoutId);
   }, [transcriptJobId, transcriptSpeakers, showTimestamps, showSpeakers, loadTranscript]);
 
+  const enqueueInputPaths = useCallback(
+    async (inputPaths: string[], source: "manual" | "drop" = "manual") => {
+      const cleaned = [...new Set(inputPaths.map((path) => path.trim()).filter(Boolean))];
+      if (cleaned.length === 0) {
+        setErrorMessage(source === "drop" ? "No files were dropped." : "Select file first.");
+        return;
+      }
+
+      const supported = cleaned.filter(isSupportedInputPath);
+      const unsupportedCount = cleaned.length - supported.length;
+      if (supported.length === 0) {
+        setErrorMessage("Only .m4a and .mp4 files are supported.");
+        return;
+      }
+
+      const duplicatePaths = supported.filter((path) => isDuplicateInputPath(path, jobs));
+      const duplicateKeys = new Set(duplicatePaths.map((path) => path.toLowerCase()));
+      let allowDuplicates = true;
+
+      if (duplicatePaths.length > 0) {
+        allowDuplicates = await confirm(
+          duplicatePaths.length === 1
+            ? "This file or filename is already in the list. Transcribe anyway?"
+            : `${duplicatePaths.length} dropped files are already in the list. Add them anyway?`,
+          {
+            title: "Duplicate Item",
+            kind: "warning",
+          },
+        );
+      }
+
+      const queueable = supported.filter((path) => allowDuplicates || !duplicateKeys.has(path.toLowerCase()));
+      if (queueable.length === 0) {
+        if (unsupportedCount > 0) {
+          setErrorMessage("No supported files were added. Only .m4a and .mp4 files are accepted.");
+        }
+        return;
+      }
+
+      setErrorMessage("");
+      const failures: string[] = [];
+      for (const path of queueable) {
+        try {
+          await invoke("enqueue_job", { inputPath: path });
+        } catch (error) {
+          failures.push(`${basename(path)}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+
+      if (failures.length > 0) {
+        setErrorMessage(failures.join("\n"));
+        return;
+      }
+
+      if (source === "manual") {
+        setSelectedInputPath("");
+      } else if (unsupportedCount > 0) {
+        setErrorMessage(`Ignored ${unsupportedCount} unsupported file(s). Only .m4a and .mp4 are accepted.`);
+      }
+    },
+    [jobs],
+  );
+
+  const handleDroppedPaths = useCallback(
+    async (paths: string[]) => {
+      await enqueueInputPaths(paths, "drop");
+    },
+    [enqueueInputPaths],
+  );
+
+  useEffect(() => {
+    let unlistenDragDrop: (() => void) | null = null;
+
+    void (async () => {
+      unlistenDragDrop = await getCurrentWebview().onDragDropEvent((event) => {
+        switch (event.payload.type) {
+          case "enter":
+          case "over":
+            setDragActive(true);
+            break;
+          case "leave":
+            setDragActive(false);
+            break;
+          case "drop":
+            setDragActive(false);
+            void handleDroppedPaths(event.payload.paths);
+            break;
+        }
+      });
+    })();
+
+    return () => {
+      unlistenDragDrop?.();
+    };
+  }, [handleDroppedPaths]);
+
   async function pickInputFile() {
     setErrorMessage("");
     const picked = await open({
@@ -281,37 +392,7 @@ function App() {
   }
 
   async function enqueueSelected() {
-    if (!selectedInputPath) {
-      setErrorMessage("Select file first.");
-      return;
-    }
-
-    const duplicate = jobs.some(
-      (job) =>
-        job.input_path.toLowerCase() === selectedInputPath.toLowerCase() ||
-        job.input_filename.toLowerCase() === basename(selectedInputPath).toLowerCase(),
-    );
-
-    if (duplicate) {
-      const accepted = await confirm(
-        "This file or filename is already in the list. Transcribe anyway?",
-        {
-          title: "Duplicate Item",
-          kind: "warning",
-        },
-      );
-      if (!accepted) {
-        return;
-      }
-    }
-
-    setErrorMessage("");
-    try {
-      await invoke("enqueue_job", { inputPath: selectedInputPath });
-      setSelectedInputPath("");
-    } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : String(error));
-    }
+    await enqueueInputPaths([selectedInputPath], "manual");
   }
 
   async function retryJob(jobId: string) {
@@ -434,6 +515,14 @@ function App() {
     speakerAliasesSnapshotRef.current = "";
   }
 
+  function openDiagnostics(jobId: string) {
+    setDiagnosticsJobId(jobId);
+  }
+
+  function closeDiagnostics() {
+    setDiagnosticsJobId(null);
+  }
+
   async function copyTranscript() {
     try {
       await navigator.clipboard.writeText(transcriptText);
@@ -451,6 +540,15 @@ function App() {
       await navigator.clipboard.writeText(text);
     } catch {
       setErrorMessage("Unable to copy fallback reason to clipboard.");
+    }
+  }
+
+  async function copyDiagnostics(job: ImportJob) {
+    const text = formatDiagnosticsLog(job);
+    try {
+      await navigator.clipboard.writeText(text || "No diagnostics recorded for this job yet.");
+    } catch {
+      setErrorMessage("Unable to copy diagnostics to clipboard.");
     }
   }
 
@@ -579,8 +677,11 @@ function App() {
         </div>
       </header>
 
-      <section className="panel import-panel">
+      <section className={`panel import-panel ${dragActive ? "drag-active" : ""}`}>
         <h2>Import</h2>
+        <div className="import-drop-note">
+          Drag `.m4a` or `.mp4` files into this window to add them directly to the queue.
+        </div>
         <div className="import-controls">
           <input
             type="text"
@@ -593,6 +694,7 @@ function App() {
             Transcribe
           </button>
         </div>
+        {dragActive && <div className="import-drop-overlay">Drop files to queue transcription</div>}
       </section>
 
       <section className="panel list-panel">
@@ -723,6 +825,7 @@ function App() {
                       <button onClick={() => retryJob(job.id)}>Retry</button>
                     )}
 
+                    <button onClick={() => openDiagnostics(job.id)}>Perf Log</button>
                     <button className="danger" onClick={() => deleteJob(job)}>
                       Delete
                     </button>
@@ -795,6 +898,43 @@ function App() {
             <div className="modal-actions">
               <button onClick={copyTranscript}>Copy</button>
               <button onClick={exportTranscript}>Export TXT</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {diagnosticsJobId && activeDiagnosticsJob && (
+        <div className="modal-backdrop" onClick={closeDiagnostics}>
+          <div className="modal diagnostics-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <div>
+                <h3>Performance Log</h3>
+                <div className="diagnostics-subtitle">{activeDiagnosticsJob.input_filename}</div>
+              </div>
+              <button onClick={closeDiagnostics}>Close</button>
+            </div>
+
+            <div className="diagnostics-body">
+              {activeDiagnosticsJob.performance_log && activeDiagnosticsJob.performance_log.length > 0 ? (
+                activeDiagnosticsJob.performance_log.map((entry, index) => (
+                  <div className="diagnostics-entry" key={`${entry.at}-${index}`}>
+                    <div className="diagnostics-entry-meta">
+                      <span className={`diagnostics-kind ${entry.kind}`}>{entry.kind}</span>
+                      <span>{formatDate(entry.at)}</span>
+                      {diagnosticsOffsetText(entry) && (
+                        <span>{diagnosticsOffsetText(entry)}</span>
+                      )}
+                    </div>
+                    <div className="diagnostics-entry-text">{entry.message}</div>
+                  </div>
+                ))
+              ) : (
+                <div className="diagnostics-empty">No diagnostics recorded for this job yet.</div>
+              )}
+            </div>
+
+            <div className="modal-actions">
+              <button onClick={() => void copyDiagnostics(activeDiagnosticsJob)}>Copy Log</button>
             </div>
           </div>
         </div>
@@ -980,12 +1120,54 @@ function basename(path: string): string {
   return normalized.split("/").filter(Boolean).pop() ?? path;
 }
 
+function isSupportedInputPath(path: string): boolean {
+  const lower = basename(path).toLowerCase();
+  return lower.endsWith(".m4a") || lower.endsWith(".mp4");
+}
+
+function isDuplicateInputPath(path: string, jobs: ImportJob[]): boolean {
+  const normalizedPath = path.toLowerCase();
+  const filename = basename(path).toLowerCase();
+  return jobs.some(
+    (job) =>
+      job.input_path.toLowerCase() === normalizedPath ||
+      job.input_filename.toLowerCase() === filename,
+  );
+}
+
 function formatDate(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
     return value;
   }
   return date.toLocaleString();
+}
+
+function diagnosticsOffsetText(entry: PerformanceLogEntry): string | null {
+  if (
+    typeof entry.offset_seconds !== "number" ||
+    !Number.isFinite(entry.offset_seconds) ||
+    entry.offset_seconds < 0
+  ) {
+    return null;
+  }
+
+  return `+${formatClock(entry.offset_seconds)}`;
+}
+
+function formatDiagnosticsLog(job: ImportJob): string {
+  const entries = job.performance_log ?? [];
+  return entries
+    .map((entry) => {
+      const parts = [formatDate(entry.at)];
+      const offset = diagnosticsOffsetText(entry);
+      if (offset) {
+        parts.push(offset);
+      }
+      parts.push(`[${entry.kind}]`);
+      return `${parts.join(" | ")} ${entry.message}`;
+    })
+    .join("\n");
 }
 
 function processingTimeText(job: ImportJob): string | null {

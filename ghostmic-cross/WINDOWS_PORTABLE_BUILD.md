@@ -9,16 +9,17 @@ The output folder contains:
 - the built Windows `.exe`
 - `resources/transcribe.py`
 - optional `portable-state.json` for first-run settings
-- optional `.venv` and `.venv-diarization` folders next to the `.exe`
+- `python\python.exe` with the transcription runtime already installed
+- `python-diarization\python.exe` with the diarization runtime already installed
 - optional `ffmpeg.exe` / `ffprobe.exe` next to the `.exe`
 
 On first launch, the app will:
 
 - seed settings from `portable-state.json` if no app state exists yet
-- auto-detect `.venv` and `.venv-diarization` near the executable
+- auto-detect the bundled Python runtimes near the executable
 - auto-detect `ffmpeg.exe` and `ffprobe.exe` near the executable
 
-This is the most reliable path to a self-contained Windows package with the current architecture.
+The build validates imports from the bundled runtimes before it reports success. A release package should not ask an end user to install Python packages.
 
 ## 1. Export current settings into a portable seed
 
@@ -66,15 +67,16 @@ If no release ZIP is available yet, it falls back to a local source build only w
 What the local fallback does automatically:
 
 - exports current app settings into a portable first-run seed if local app state exists
-- creates `.venv`
-- creates `.venv-diarization`
-- installs Python dependencies
+- downloads the official Windows embeddable Python runtime
+- installs transcription packages into `python\Lib\site-packages`
+- installs diarization packages into `python-diarization\Lib\site-packages`
+- verifies `faster_whisper`, `whisperx`, and `pyannote.audio` imports from the bundled runtimes
 - runs the Tauri Windows build
 - creates a portable output folder with:
   - the `.exe`
   - `resources/transcribe.py`
-  - bundled `.venv`
-  - bundled `.venv-diarization`
+  - bundled `python`
+  - bundled `python-diarization`
   - `portable-state.json` if settings were exported
 
 The ready-made release asset is published as:
@@ -92,6 +94,8 @@ If you explicitly want to compile locally from source, run:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Scripts\build_windows_portable.ps1 -FfmpegDir "C:\path\to\ffmpeg\bin"
 ```
+
+If you deliberately want a smaller transcription-only package, add `-SkipDiarizationRuntime`.
 
 Output:
 

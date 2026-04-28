@@ -17,6 +17,9 @@ const JOBS_EVENT: &str = "ghostmic://jobs-updated";
 const SETTINGS_EVENT: &str = "ghostmic://settings-updated";
 const PORTABLE_STATE_FILE_NAME: &str = "portable-state.json";
 const STATE_SCHEMA_VERSION: u32 = 2;
+const MAX_PERFORMANCE_LOG_ENTRIES: usize = 80;
+const PERFORMANCE_GAP_WARNING_SECONDS: i64 = 15 * 60;
+const PERFORMANCE_PROGRESS_MILESTONE_STEP: f64 = 25.0;
 
 #[cfg(windows)]
 const FFMPEG_BINARY_NAME: &str = "ffmpeg.exe";
@@ -89,6 +92,14 @@ impl LanguageMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct PerformanceLogEntry {
+    at: DateTime<Utc>,
+    offset_seconds: Option<f64>,
+    kind: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ImportJob {
     id: String,
     input_path: String,
@@ -122,6 +133,14 @@ struct ImportJob {
     is_paused: bool,
     #[serde(default)]
     speaker_aliases: BTreeMap<String, String>,
+    #[serde(default)]
+    performance_log: Vec<PerformanceLogEntry>,
+    #[serde(skip)]
+    last_progress_log_at: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    last_progress_log_stage: Option<String>,
+    #[serde(skip)]
+    last_progress_log_percent: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,6 +254,12 @@ struct RuntimePayload {
     fallback_reason: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DiagnosticPayload {
+    kind: Option<String>,
+    message: String,
+}
+
 #[derive(Debug)]
 struct RunResult {
     exit_code: i32,
@@ -288,12 +313,86 @@ struct JobMetadata {
     diarization_fallback_reason: Option<String>,
     #[serde(default)]
     fallback_events: Vec<String>,
+    #[serde(default)]
+    performance_log: Vec<PerformanceLogEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct TranscriptSpeaker {
     label: String,
     alias: String,
+}
+
+fn append_performance_log(
+    job: &mut ImportJob,
+    kind: &str,
+    message: impl Into<String>,
+    at: DateTime<Utc>,
+) {
+    let text = message.into();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let entry = PerformanceLogEntry {
+        at,
+        offset_seconds: job.processing_started_at.map(|started| {
+            let millis = (at - started).num_milliseconds();
+            (millis as f64 / 1000.0).max(0.0)
+        }),
+        kind: kind.to_string(),
+        message: trimmed.to_string(),
+    };
+
+    let is_duplicate = job
+        .performance_log
+        .last()
+        .is_some_and(|last| last.kind == entry.kind && last.message == entry.message);
+    if is_duplicate {
+        return;
+    }
+
+    job.performance_log.push(entry);
+    if job.performance_log.len() > MAX_PERFORMANCE_LOG_ENTRIES {
+        let overflow = job.performance_log.len() - MAX_PERFORMANCE_LOG_ENTRIES;
+        job.performance_log.drain(0..overflow);
+    }
+}
+
+fn append_performance_log_to_job(
+    shared: &AppShared,
+    job_id: &str,
+    kind: &str,
+    message: impl Into<String>,
+) -> bool {
+    let mut updated = false;
+    if let Ok(mut guard) = shared.core.worker.lock() {
+        if let Some(job) = guard.persisted.jobs.iter_mut().find(|j| j.id == job_id) {
+            append_performance_log(job, kind, message, Utc::now());
+            updated = true;
+        }
+    }
+    if updated {
+        let _ = persist_state(&shared.core);
+        emit_full_state(&shared.core);
+    }
+    updated
+}
+
+fn format_duration_label(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as i64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let secs = total % 60;
+    format!("{hours:02}:{minutes:02}:{secs:02}")
+}
+
+fn format_ratio_label(ratio: Option<f64>) -> String {
+    ratio
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| format!("{value:.2}x"))
+        .unwrap_or_else(|| "--".to_string())
 }
 
 #[tauri::command]
@@ -438,6 +537,10 @@ fn enqueue_job(state: State<'_, AppShared>, input_path: String) -> Result<Import
         processing_started_at: None,
         is_paused: false,
         speaker_aliases: BTreeMap::new(),
+        performance_log: Vec::new(),
+        last_progress_log_at: None,
+        last_progress_log_stage: None,
+        last_progress_log_percent: None,
     };
 
     guard.persisted.jobs.push(job.clone());
@@ -480,6 +583,10 @@ fn retry_job(state: State<'_, AppShared>, job_id: String) -> Result<(), String> 
     job.progress_eta_seconds = None;
     job.processing_started_at = None;
     job.is_paused = false;
+    job.performance_log.clear();
+    job.last_progress_log_at = None;
+    job.last_progress_log_stage = None;
+    job.last_progress_log_percent = None;
 
     drop(guard);
     persist_state(&state.core)?;
@@ -545,6 +652,10 @@ fn cancel_job(state: State<'_, AppShared>, job_id: String) -> Result<(), String>
             job.progress_eta_seconds = None;
             job.processing_started_at = None;
             job.is_paused = false;
+            job.performance_log.clear();
+            job.last_progress_log_at = None;
+            job.last_progress_log_stage = None;
+            job.last_progress_log_percent = None;
         }
         JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled => {}
     }
@@ -872,6 +983,16 @@ fn worker_loop(shared: AppShared) {
                 job.progress_eta_seconds = None;
                 job.processing_started_at = Some(Utc::now());
                 job.is_paused = false;
+                job.performance_log.clear();
+                job.last_progress_log_at = None;
+                job.last_progress_log_stage = None;
+                job.last_progress_log_percent = None;
+                append_performance_log(
+                    job,
+                    "worker",
+                    "Worker picked the job and started processing.",
+                    Utc::now(),
+                );
             }
 
             guard.active_job_id = Some(job_id.clone());
@@ -948,6 +1069,7 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
                             processing_metrics.as_ref().and_then(|metrics| metrics.1),
                             wall_metrics.as_ref().map(|metrics| metrics.0),
                             wall_metrics.as_ref().and_then(|metrics| metrics.1),
+                            &job.performance_log,
                         );
                     }
 
@@ -957,6 +1079,12 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
                         job.status = JobStatus::Cancelled;
                         job.error_message = Some("Cancelled by user.".to_string());
                         job.is_paused = false;
+                        append_performance_log(
+                            job,
+                            "summary",
+                            "Job was cancelled by the user.",
+                            finished_at,
+                        );
                     } else if result.exit_code == 0 {
                         job.status = JobStatus::Done;
                         job.output_txt_path = Some(result.output_path.clone());
@@ -966,6 +1094,48 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
                         if let Some(metadata) = success_metadata.as_ref() {
                             apply_job_metadata(job, metadata);
                         }
+                        if let Some(last_progress_at) = job.last_progress_log_at {
+                            let gap_seconds = (finished_at - last_progress_at).num_seconds();
+                            if gap_seconds >= PERFORMANCE_GAP_WARNING_SECONDS {
+                                append_performance_log(
+                                    job,
+                                    "warning",
+                                    format!(
+                                        "Job finished after a silent gap of {} since the last progress update.",
+                                        format_duration_label(gap_seconds as f64)
+                                    ),
+                                    finished_at,
+                                );
+                            }
+                        }
+                        let wall_text = wall_metrics
+                            .as_ref()
+                            .map(|metrics| {
+                                format!(
+                                    "{} ({})",
+                                    format_duration_label(metrics.0),
+                                    format_ratio_label(metrics.1)
+                                )
+                            })
+                            .unwrap_or_else(|| "--".to_string());
+                        let process_text = processing_metrics
+                            .as_ref()
+                            .map(|metrics| {
+                                format!(
+                                    "{} ({})",
+                                    format_duration_label(metrics.0),
+                                    format_ratio_label(metrics.1)
+                                )
+                            })
+                            .unwrap_or_else(|| "--".to_string());
+                        append_performance_log(
+                            job,
+                            "summary",
+                            format!(
+                                "Job completed successfully. Wall time {wall_text}. Process time {process_text}."
+                            ),
+                            finished_at,
+                        );
                     } else {
                         let combined = format!(
                             "{}\n{}",
@@ -981,6 +1151,12 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
                             combined
                         });
                         job.notice_message = None;
+                        append_performance_log(
+                            job,
+                            "error",
+                            format!("Job failed with exit code {}.", result.exit_code),
+                            finished_at,
+                        );
                     }
                 }
                 Err(error) => {
@@ -990,6 +1166,12 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
                         job.status = JobStatus::Cancelled;
                         job.error_message = Some("Cancelled by user.".to_string());
                         job.is_paused = false;
+                        append_performance_log(
+                            job,
+                            "summary",
+                            "Job was cancelled by the user.",
+                            finished_at,
+                        );
                     } else {
                         job.status = JobStatus::Failed;
                         job.error_message = Some(error);
@@ -998,6 +1180,12 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
                         job.audio_to_processing_ratio = None;
                         job.wall_elapsed_seconds = None;
                         job.audio_to_wall_ratio = None;
+                        append_performance_log(
+                            job,
+                            "error",
+                            "Job failed before transcription metadata was finalized.",
+                            finished_at,
+                        );
                     }
                 }
             }
@@ -1046,7 +1234,24 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
     fs::create_dir_all(&shared.core.metadata_dir)
         .map_err(|e| format!("Unable to prepare metadata directory: {e}"))?;
 
+    let _ = append_performance_log_to_job(
+        shared,
+        job_id,
+        "audio",
+        format!("Preparing audio with ffmpeg for {}.", job.input_filename),
+    );
+    let audio_prep_started = Instant::now();
     let prepared = prepare_audio(&shared.core.normalized_dir, &job)?;
+    let _ = append_performance_log_to_job(
+        shared,
+        job_id,
+        "audio",
+        format!(
+            "Audio prepared in {}. Duration {}.",
+            format_duration_label(audio_prep_started.elapsed().as_secs_f64()),
+            format_duration_label(prepared.duration_seconds)
+        ),
+    );
 
     {
         let mut guard = shared
@@ -1081,8 +1286,23 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
 
     let python_binary =
         resolve_python_binary(&settings, &shared.core.script_path, job.diarization_enabled)?;
+    let _ = append_performance_log_to_job(
+        shared,
+        job_id,
+        "runtime",
+        format!(
+            "Selected Python runtime: {}{}",
+            python_binary,
+            if job.diarization_enabled {
+                " (diarization enabled)"
+            } else {
+                ""
+            }
+        ),
+    );
 
     let mut command = Command::new(&python_binary);
+    configure_python_command(&mut command, &python_binary);
     command
         .arg(&shared.core.script_path)
         .arg("--input")
@@ -1115,6 +1335,12 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
     let child = command
         .spawn()
         .map_err(|e| format!("Unable to start transcription process: {e}"))?;
+    let _ = append_performance_log_to_job(
+        shared,
+        job_id,
+        "worker",
+        "Python transcription subprocess started.",
+    );
 
     let child_arc = Arc::new(Mutex::new(child));
 
@@ -1149,25 +1375,26 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
 
     let stderr_thread = thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
-        let mut content = String::new();
-        let _ = reader.read_to_string(&mut content);
-        content
+        let mut content = Vec::new();
+        let _ = reader.read_to_end(&mut content);
+        String::from_utf8_lossy(&content).into_owned()
     });
 
     let mut stdout_reader = BufReader::new(stdout);
-    let mut line = String::new();
+    let mut line = Vec::new();
     let mut stdout_non_progress: Vec<String> = Vec::new();
 
     loop {
         line.clear();
         let bytes = stdout_reader
-            .read_line(&mut line)
+            .read_until(b'\n', &mut line)
             .map_err(|e| format!("Failed to read transcription output: {e}"))?;
         if bytes == 0 {
             break;
         }
 
-        let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+        let text = String::from_utf8_lossy(&line);
+        let trimmed = text.trim_end_matches(['\r', '\n']).to_string();
         if trimmed.is_empty() {
             continue;
         }
@@ -1211,6 +1438,31 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
 
 fn apply_runtime_line(shared: &AppShared, job_id: &str, line: &str) -> bool {
     if let Some(payload) = line
+        .strip_prefix("VUKHOAI_DIAG ")
+        .or_else(|| line.strip_prefix("GHOSTMIC_DIAG "))
+    {
+        let parsed = serde_json::from_str::<DiagnosticPayload>(payload);
+        let Ok(diagnostic) = parsed else {
+            return false;
+        };
+
+        if let Ok(mut guard) = shared.core.worker.lock() {
+            if let Some(job) = guard.persisted.jobs.iter_mut().find(|j| j.id == job_id) {
+                append_performance_log(
+                    job,
+                    diagnostic.kind.as_deref().unwrap_or("detail"),
+                    diagnostic.message,
+                    Utc::now(),
+                );
+            }
+        }
+
+        let _ = persist_state(&shared.core);
+        emit_full_state(&shared.core);
+        return true;
+    }
+
+    if let Some(payload) = line
         .strip_prefix("VUKHOAI_RUNTIME ")
         .or_else(|| line.strip_prefix("GHOSTMIC_RUNTIME "))
     {
@@ -1246,6 +1498,38 @@ fn apply_runtime_line(shared: &AppShared, job_id: &str, line: &str) -> bool {
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(str::to_string);
+                let mut message = format!(
+                    "Runtime selected: {} on {}",
+                    runtime.engine.as_deref().unwrap_or("transcription"),
+                    if runtime.gpu_active == Some(true) || runtime.device.as_deref() == Some("cuda")
+                    {
+                        "GPU"
+                    } else if runtime.gpu_active == Some(false)
+                        || runtime.device.as_deref() == Some("cpu")
+                    {
+                        "CPU"
+                    } else {
+                        runtime.device.as_deref().unwrap_or("unknown device")
+                    }
+                );
+                if let Some(compute_type) = runtime
+                    .compute_type
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    message.push_str(&format!(" ({compute_type})"));
+                }
+                if let Some(reason) = runtime
+                    .fallback_reason
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    message.push_str(". ");
+                    message.push_str(reason);
+                }
+                append_performance_log(job, "runtime", message, Utc::now());
             }
         }
 
@@ -1268,6 +1552,7 @@ fn apply_runtime_line(shared: &AppShared, job_id: &str, line: &str) -> bool {
                 let message = notice.message.trim();
                 if !message.is_empty() {
                     job.notice_message = Some(message.to_string());
+                    append_performance_log(job, "notice", message, Utc::now());
                 }
             }
         }
@@ -1291,9 +1576,64 @@ fn apply_runtime_line(shared: &AppShared, job_id: &str, line: &str) -> bool {
 
     if let Ok(mut guard) = shared.core.worker.lock() {
         if let Some(job) = guard.persisted.jobs.iter_mut().find(|j| j.id == job_id) {
-            job.progress_percent = Some(progress.percent.clamp(0.0, 100.0));
-            job.progress_stage = Some(progress.stage);
+            let now = Utc::now();
+            let percent = progress.percent.clamp(0.0, 100.0);
+            let stage = progress.stage.trim().to_string();
+            let eta_text = progress
+                .eta_seconds
+                .filter(|value| *value > 0.0)
+                .map(format_duration_label);
+            let gap_seconds = job
+                .last_progress_log_at
+                .map(|last| (now - last).num_seconds())
+                .filter(|value| *value > 0);
+            let stage_changed = job.last_progress_log_stage.as_deref() != Some(stage.as_str());
+            let percent_advanced = job
+                .last_progress_log_percent
+                .map(|last| percent - last)
+                .unwrap_or(percent);
+
+            job.progress_percent = Some(percent);
+            job.progress_stage = Some(stage.clone());
             job.progress_eta_seconds = progress.eta_seconds.filter(|v| *v >= 0.0);
+
+            let mut message: Option<String> = None;
+            if stage_changed {
+                message = Some(match eta_text.as_deref() {
+                    Some(eta) => format!("Stage: {stage} ({percent:.0}%). ETA ~ {eta}."),
+                    None => format!("Stage: {stage} ({percent:.0}%)."),
+                });
+            } else if gap_seconds.is_some_and(|value| value >= PERFORMANCE_GAP_WARNING_SECONDS) {
+                let gap = format_duration_label(gap_seconds.unwrap_or_default() as f64);
+                message = Some(match eta_text.as_deref() {
+                    Some(eta) => format!(
+                        "Long gap without progress updates: {gap} before {stage} ({percent:.0}%). ETA ~ {eta}."
+                    ),
+                    None => format!(
+                        "Long gap without progress updates: {gap} before {stage} ({percent:.0}%)."
+                    ),
+                });
+            } else if percent_advanced >= PERFORMANCE_PROGRESS_MILESTONE_STEP {
+                message = Some(match eta_text.as_deref() {
+                    Some(eta) => {
+                        format!("Progress milestone: {percent:.0}% / {stage}. ETA ~ {eta}.")
+                    }
+                    None => format!("Progress milestone: {percent:.0}% / {stage}."),
+                });
+            }
+
+            if let Some(text) = message {
+                append_performance_log(job, "progress", text, now);
+                job.last_progress_log_at = Some(now);
+                job.last_progress_log_stage = Some(stage);
+                job.last_progress_log_percent = Some(percent);
+            } else {
+                job.last_progress_log_at = Some(now);
+                if stage_changed {
+                    job.last_progress_log_stage = Some(stage);
+                    job.last_progress_log_percent = Some(percent);
+                }
+            }
         }
     }
 
@@ -1474,7 +1814,10 @@ fn resolve_python_binary(
         }
     }
 
-    candidates.extend(discover_local_venv_python_candidates(script_path));
+    candidates.extend(discover_local_python_candidates(
+        script_path,
+        diarization_enabled,
+    ));
     candidates.push("python3".to_string());
     candidates.push("python".to_string());
 
@@ -1515,64 +1858,82 @@ fn resolve_python_binary(
     }
 
     if !missing_transcription_for.is_empty() {
-        let preferred = missing_transcription_for
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "python3".to_string());
-        let install_hint = build_requirements_install_hint(script_path, &preferred);
         return Err(format!(
-            "Python found but dependency `faster_whisper` is missing. {} Or set Settings -> Python path to a ready virtualenv Python.",
-            install_hint
+            "Transcription runtime is not ready. Reinstall the Windows portable package or choose a working runtime in Settings. Checked runtimes: {}",
+            missing_transcription_for.join(", ")
         ));
     }
 
     if diarization_enabled && !missing_diarization_for.is_empty() {
-        let preferred = missing_diarization_for
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "python3".to_string());
-        let install_hint = build_diarization_requirements_install_hint(script_path, &preferred);
         return Err(format!(
-            "Diarization is enabled, but no Python runtime with `whisperx` + `pyannote.audio` was found. {} Or set Settings -> Diarization Python to a ready environment.",
-            install_hint
+            "Diarization runtime is not ready. The app can still transcribe without diarization, or you can choose a working diarization runtime in Settings. Checked runtimes: {}",
+            missing_diarization_for.join(", ")
         ));
     }
 
-    Err(
-        "Python executable not found. Set it in Settings -> Python path or install python3."
-            .to_string(),
-    )
+    Err("Bundled transcription runtime was not found. Reinstall the Windows portable package or choose a working runtime in Settings.".to_string())
+}
+
+fn configure_python_command(command: &mut Command, python_binary: &str) {
+    command.env_remove("PYTHONHOME");
+    command.env_remove("PYTHONPATH");
+    command.env("PYTHONUTF8", "1");
+    command.env("PYTHONIOENCODING", "utf-8");
+    command.env("PYTHONUNBUFFERED", "1");
+
+    let python_path = Path::new(python_binary);
+    let Some(parent) = python_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    else {
+        return;
+    };
+
+    let mut paths = vec![parent.to_path_buf()];
+    let site_packages = parent.join("Lib").join("site-packages");
+    if site_packages.exists() {
+        paths.push(site_packages);
+    }
+
+    if let Some(existing_path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing_path));
+    }
+
+    if let Ok(joined) = std::env::join_paths(paths) {
+        command.env("PATH", joined);
+    }
 }
 
 fn inspect_python_runtime(candidate: &str) -> Option<PythonRuntimeCapabilities> {
-    if Command::new(candidate).arg("--version").output().is_err() {
+    let mut version_command = Command::new(candidate);
+    configure_python_command(&mut version_command, candidate);
+    if version_command.arg("--version").output().is_err() {
         return None;
     }
 
     let script = r#"
-import importlib.util
+import importlib
 import json
 
-def has_spec(name):
+def can_import(name, attr=None):
     try:
-        return importlib.util.find_spec(name) is not None
-    except ModuleNotFoundError:
-        return False
+        module = importlib.import_module(name)
+        if attr:
+            getattr(module, attr)
+        return True
     except Exception:
         return False
 
 print(json.dumps({
-    "faster_whisper": has_spec("faster_whisper"),
-    "whisperx": has_spec("whisperx"),
-    "pyannote_audio": has_spec("pyannote.audio"),
+    "faster_whisper": can_import("faster_whisper", "WhisperModel"),
+    "whisperx": can_import("whisperx"),
+    "pyannote_audio": can_import("pyannote.audio"),
 }))
 "#;
 
-    let output = Command::new(candidate)
-        .arg("-c")
-        .arg(script)
-        .output()
-        .ok()?;
+    let mut inspect_command = Command::new(candidate);
+    configure_python_command(&mut inspect_command, candidate);
+    let output = inspect_command.arg("-c").arg(script).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1586,7 +1947,7 @@ print(json.dumps({
     })
 }
 
-fn discover_local_venv_python_candidates(script_path: &Path) -> Vec<String> {
+fn discover_local_python_candidates(script_path: &Path, diarization_enabled: bool) -> Vec<String> {
     let mut results: Vec<String> = Vec::new();
     let mut roots: Vec<PathBuf> = Vec::new();
 
@@ -1612,6 +1973,27 @@ fn discover_local_venv_python_candidates(script_path: &Path) -> Vec<String> {
             continue;
         }
 
+        let portable_runtime_dirs = if diarization_enabled {
+            ["python-diarization", "python-whisperx", "python"]
+        } else {
+            ["python", "python-diarization", "python-whisperx"]
+        };
+
+        for parent_dir in ["", "runtime", "resources"] {
+            let base = if parent_dir.is_empty() {
+                root.clone()
+            } else {
+                root.join(parent_dir)
+            };
+
+            for runtime_dir in portable_runtime_dirs {
+                let candidate = base.join(runtime_dir).join("python.exe");
+                if candidate.exists() {
+                    results.push(candidate.to_string_lossy().into_owned());
+                }
+            }
+        }
+
         for env_dir in [
             ".venv-diarization",
             ".venv-whisperx",
@@ -1631,41 +2013,6 @@ fn discover_local_venv_python_candidates(script_path: &Path) -> Vec<String> {
     }
 
     results
-}
-
-fn find_requirements_file(script_path: &Path) -> Option<PathBuf> {
-    for ancestor in script_path.ancestors() {
-        let candidate = ancestor.join("Scripts").join("requirements.txt");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    if let Ok(current_dir) = std::env::current_dir() {
-        for ancestor in current_dir.ancestors() {
-            let candidate = ancestor.join("Scripts").join("requirements.txt");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    None
-}
-
-fn build_requirements_install_hint(script_path: &Path, python_bin: &str) -> String {
-    if let Some(requirements) = find_requirements_file(script_path) {
-        return format!(
-            "Install dependencies with: \"{}\" -m pip install -r \"{}\"",
-            python_bin,
-            requirements.to_string_lossy()
-        );
-    }
-
-    format!(
-        "Install dependencies with: \"{}\" -m pip install -r Scripts/requirements.txt",
-        python_bin
-    )
 }
 
 fn find_diarization_requirements_file(script_path: &Path) -> Option<PathBuf> {
@@ -1690,21 +2037,6 @@ fn find_diarization_requirements_file(script_path: &Path) -> Option<PathBuf> {
     }
 
     None
-}
-
-fn build_diarization_requirements_install_hint(script_path: &Path, python_bin: &str) -> String {
-    if let Some(requirements) = find_diarization_requirements_file(script_path) {
-        return format!(
-            "Install diarization dependencies with: \"{}\" -m pip install -r \"{}\"",
-            python_bin,
-            requirements.to_string_lossy()
-        );
-    }
-
-    format!(
-        "Install diarization dependencies with: \"{}\" -m pip install -r Scripts/requirements-diarization.txt",
-        python_bin
-    )
 }
 
 fn default_output_directory() -> PathBuf {
@@ -2217,6 +2549,9 @@ fn apply_job_metadata(job: &mut ImportJob, metadata: &JobMetadata) {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    if !metadata.performance_log.is_empty() {
+        job.performance_log = metadata.performance_log.clone();
+    }
 }
 
 fn compute_audio_to_processing_ratio(
@@ -2241,6 +2576,7 @@ fn persist_job_metrics_to_metadata(
     audio_to_processing_ratio: Option<f64>,
     wall_elapsed_seconds: Option<f64>,
     audio_to_wall_ratio: Option<f64>,
+    performance_log: &[PerformanceLogEntry],
 ) {
     let Ok(content) = fs::read_to_string(meta_path) else {
         return;
@@ -2281,6 +2617,9 @@ fn persist_job_metrics_to_metadata(
             None => serde_json::Value::Null,
         },
     );
+    if let Ok(value) = serde_json::to_value(performance_log) {
+        object.insert("performance_log".to_string(), value);
+    }
 
     if let Ok(serialized) = serde_json::to_string_pretty(&value) {
         let _ = fs::write(meta_path, serialized);

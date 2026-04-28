@@ -46,12 +46,12 @@ def emit_progress(percent: float, stage: str, eta_seconds: Optional[float] = Non
     if eta_seconds is not None and eta_seconds >= 0:
         payload["eta_seconds"] = float(eta_seconds)
 
-    print("VUKHOAI_PROGRESS " + json.dumps(payload, ensure_ascii=False), flush=True)
+    print("VUKHOAI_PROGRESS " + json.dumps(payload, ensure_ascii=True), flush=True)
 
 
 def emit_notice(message: str) -> None:
     payload = {"message": str(message or "").strip()}
-    print("VUKHOAI_NOTICE " + json.dumps(payload, ensure_ascii=False), flush=True)
+    print("VUKHOAI_NOTICE " + json.dumps(payload, ensure_ascii=True), flush=True)
 
 
 def emit_runtime_state(
@@ -70,7 +70,16 @@ def emit_runtime_state(
     if fallback_reason:
         payload["fallback_reason"] = str(fallback_reason).strip()
 
-    print("VUKHOAI_RUNTIME " + json.dumps(payload, ensure_ascii=False), flush=True)
+    print("VUKHOAI_RUNTIME " + json.dumps(payload, ensure_ascii=True), flush=True)
+
+
+def emit_diagnostic(kind: str, message: str) -> None:
+    payload = {
+        "kind": str(kind or "detail").strip() or "detail",
+        "message": str(message or "").strip(),
+    }
+    if payload["message"]:
+        print("VUKHOAI_DIAG " + json.dumps(payload, ensure_ascii=True), flush=True)
 
 
 def combine_fallback_reasons(*reasons: Optional[str]) -> Optional[str]:
@@ -434,11 +443,16 @@ def transcribe_with_whisperx(
         fallback_reason=runtime_fallback_reason,
     )
 
+    model_load_started = time.perf_counter()
     model = whisperx.load_model(
         model_name,
         device=device,
         compute_type=compute_type,
         vad_method="silero",
+    )
+    emit_diagnostic(
+        "phase",
+        f"WhisperX model loaded in {format_timestamp(time.perf_counter() - model_load_started)}.",
     )
     transcribe_kwargs: Dict[str, Any] = {
         "batch_size": 8,
@@ -447,7 +461,12 @@ def transcribe_with_whisperx(
         transcribe_kwargs["language"] = UKRAINIAN_LANGUAGE
 
     emit_progress(20, "Transcribing")
+    transcribe_started = time.perf_counter()
     result = model.transcribe(audio_path, **transcribe_kwargs)
+    emit_diagnostic(
+        "phase",
+        f"WhisperX transcription pass finished in {format_timestamp(time.perf_counter() - transcribe_started)}.",
+    )
     segments = result.get("segments", [])
 
     detected_language = result.get("language") if language_mode == "auto" else UKRAINIAN_LANGUAGE
@@ -459,7 +478,12 @@ def transcribe_with_whisperx(
         emit_progress(22, "Retrying with Ukrainian")
         retry_kwargs = dict(transcribe_kwargs)
         retry_kwargs["language"] = UKRAINIAN_LANGUAGE
+        retry_started = time.perf_counter()
         result = model.transcribe(audio_path, **retry_kwargs)
+        emit_diagnostic(
+            "phase",
+            f"WhisperX Ukrainian retry finished in {format_timestamp(time.perf_counter() - retry_started)}.",
+        )
         segments = result.get("segments", [])
         detected_language = UKRAINIAN_LANGUAGE
 
@@ -471,6 +495,7 @@ def transcribe_with_whisperx(
     if detected_language and segments:
         try:
             emit_progress(55, "Aligning timestamps")
+            align_started = time.perf_counter()
             align_model, metadata = whisperx.load_align_model(language_code=detected_language, device=device)
             aligned = whisperx.align(
                 result["segments"],
@@ -483,6 +508,10 @@ def transcribe_with_whisperx(
             result_for_speakers = aligned
             segments = aligned.get("segments", segments)
             alignment_applied = True
+            emit_diagnostic(
+                "phase",
+                f"Alignment finished in {format_timestamp(time.perf_counter() - align_started)}.",
+            )
         except Exception as exc:  # pragma: no cover - fallback path
             alignment_error = f"{type(exc).__name__}: {exc}"
 
@@ -495,9 +524,15 @@ def transcribe_with_whisperx(
             from whisperx.diarize import DiarizationPipeline  # type: ignore
 
             emit_progress(68, "Checking diarization readiness")
+            diarization_ready_started = time.perf_counter()
             diarization_pipeline = DiarizationPipeline(
                 token=hf_token,
                 device=device,
+            )
+            emit_diagnostic(
+                "phase",
+                "Diarization pipeline initialized in "
+                f"{format_timestamp(time.perf_counter() - diarization_ready_started)}.",
             )
         except Exception as exc:  # pragma: no cover - fallback path
             diarization_error = f"{type(exc).__name__}: {exc}"
@@ -508,10 +543,15 @@ def transcribe_with_whisperx(
     if diarization_enabled and diarization_pipeline is not None:
         try:
             emit_progress(82, "Applying diarization")
+            diarization_started = time.perf_counter()
             diarized = diarization_pipeline(audio_path)
             assigned = whisperx.assign_word_speakers(diarized, result_for_speakers)
             segments = assigned.get("segments", segments)
             diarization_applied = True
+            emit_diagnostic(
+                "phase",
+                f"Diarization finished in {format_timestamp(time.perf_counter() - diarization_started)}.",
+            )
         except Exception as exc:  # pragma: no cover - fallback path
             diarization_error = f"{type(exc).__name__}: {exc}"
             if not hf_token:
@@ -556,10 +596,16 @@ def transcribe_with_faster_whisper(
         emit_notice(runtime.notice)
 
     emit_progress(10, "Loading model")
+    model_load_started = time.perf_counter()
     model = WhisperModel(model_name, device=runtime.device, compute_type=runtime.compute_type)
+    emit_diagnostic(
+        "phase",
+        f"faster-whisper model loaded in {format_timestamp(time.perf_counter() - model_load_started)}.",
+    )
     language = None if language_mode == "auto" else UKRAINIAN_LANGUAGE
 
     emit_progress(15, "Transcribing")
+    transcribe_started = time.perf_counter()
     generated_segments, info = model.transcribe(
         audio_path,
         language=language,
@@ -574,11 +620,17 @@ def transcribe_with_faster_whisper(
         language_retry_reason = f"auto_detected_{original_language}_forced_uk"
         emit_notice(wrong_language_notice(original_language))
         emit_progress(17, "Retrying with Ukrainian")
+        retry_started = time.perf_counter()
         generated_segments, info = model.transcribe(
             audio_path,
             language=UKRAINIAN_LANGUAGE,
             vad_filter=True,
             word_timestamps=True,
+        )
+        emit_diagnostic(
+            "phase",
+            "faster-whisper Ukrainian retry finished in "
+            f"{format_timestamp(time.perf_counter() - retry_started)}.",
         )
         detected_language = UKRAINIAN_LANGUAGE
 
@@ -612,6 +664,11 @@ def transcribe_with_faster_whisper(
             if progress - last_reported >= 0.5:
                 emit_progress(progress, "Transcribing", eta_seconds)
                 last_reported = progress
+
+    emit_diagnostic(
+        "phase",
+        f"faster-whisper transcription pass finished in {format_timestamp(time.time() - started_at)}.",
+    )
 
     meta = {
         "engine": "faster-whisper",

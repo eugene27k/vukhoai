@@ -227,6 +227,24 @@ select:disabled {
   padding: 20px;
 }
 
+.import-panel {
+  position: relative;
+  transition:
+    border-color 0.16s ease,
+    box-shadow 0.16s ease,
+    background-color 0.16s ease,
+    transform 0.16s ease;
+}
+
+.import-panel.drag-active {
+  border-color: rgba(242, 183, 5, 0.46);
+  box-shadow: 0 0 0 3px rgba(242, 183, 5, 0.12), var(--shadow-sm);
+  background:
+    linear-gradient(180deg, rgba(242, 183, 5, 0.06) 0%, transparent 100%),
+    var(--color-surface);
+  transform: translateY(-1px);
+}
+
 .import-panel h2,
 .list-panel h2 {
   margin: 0 0 14px;
@@ -236,10 +254,33 @@ select:disabled {
   color: var(--color-text-muted);
 }
 
+.import-drop-note {
+  margin: -2px 0 14px;
+  color: var(--color-text-secondary);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
 .import-controls {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
   gap: 12px;
+}
+
+.import-drop-overlay {
+  position: absolute;
+  inset: 12px;
+  display: grid;
+  place-items: center;
+  border-radius: 20px;
+  border: 2px dashed rgba(242, 183, 5, 0.5);
+  background: rgba(15, 15, 15, 0.74);
+  color: var(--color-primary);
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+  z-index: 2;
 }
 
 input,
@@ -828,6 +869,88 @@ progress::-moz-progress-bar {
 
 .settings-modal {
   width: min(760px, 96vw);
+}
+
+.diagnostics-modal {
+  width: min(1040px, 96vw);
+}
+
+.diagnostics-subtitle {
+  margin-top: 4px;
+  color: var(--color-text-secondary);
+  font-size: 0.88rem;
+}
+
+.diagnostics-body {
+  margin-top: 10px;
+  display: grid;
+  gap: 10px;
+  max-height: 60vh;
+  overflow: auto;
+}
+
+.diagnostics-entry {
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-muted);
+}
+
+.diagnostics-entry-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  color: var(--color-text-secondary);
+  font-size: 0.8rem;
+}
+
+.diagnostics-kind {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--color-text);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 700;
+}
+
+.diagnostics-kind.warning {
+  border-color: rgba(242, 183, 5, 0.3);
+  background: rgba(242, 183, 5, 0.12);
+}
+
+.diagnostics-kind.error {
+  border-color: rgba(255, 255, 255, 0.1);
+  background: rgba(17, 17, 17, 0.5);
+}
+
+.diagnostics-kind.progress,
+.diagnostics-kind.phase,
+.diagnostics-kind.runtime {
+  border-color: rgba(0, 87, 183, 0.28);
+  background: rgba(0, 87, 183, 0.12);
+}
+
+.diagnostics-entry-text {
+  margin-top: 8px;
+  white-space: pre-wrap;
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  font-size: 0.86rem;
+  line-height: 1.55;
+}
+
+.diagnostics-empty {
+  padding: 18px;
+  border-radius: 16px;
+  border: 1px dashed var(--color-border);
+  color: var(--color-text-secondary);
+  text-align: center;
 }
 
 .settings-grid {
