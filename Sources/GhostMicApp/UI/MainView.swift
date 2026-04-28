@@ -189,12 +189,15 @@ struct MainView: View {
     }
 
     private var filteredJobs: [ImportJob] {
+        let jobs: [ImportJob]
         switch listFilter {
         case .all:
-            return jobStore.jobs
+            jobs = jobStore.jobs
         case .completedOnly:
-            return jobStore.jobs.filter { $0.status == .done }
+            jobs = jobStore.jobs.filter { $0.status == .done }
         }
+
+        return jobs.sorted { $0.createdAt > $1.createdAt }
     }
 
     @ViewBuilder

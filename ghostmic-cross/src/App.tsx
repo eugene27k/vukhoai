@@ -101,6 +101,17 @@ function resolveInitialThemeMode(): ThemeMode {
   }
 }
 
+function compareJobsByNewest(a: ImportJob, b: ImportJob): number {
+  const aCreatedAt = Date.parse(a.created_at);
+  const bCreatedAt = Date.parse(b.created_at);
+
+  if (Number.isFinite(aCreatedAt) && Number.isFinite(bCreatedAt) && aCreatedAt !== bCreatedAt) {
+    return bCreatedAt - aCreatedAt;
+  }
+
+  return b.created_at.localeCompare(a.created_at);
+}
+
 function App() {
   const [jobs, setJobs] = useState<ImportJob[]>([]);
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -136,10 +147,12 @@ function App() {
   );
 
   const filteredJobs = useMemo(() => {
-    if (listFilter === "completed_only") {
-      return jobs.filter((job) => job.status === "done");
-    }
-    return jobs;
+    const visibleJobs =
+      listFilter === "completed_only"
+        ? jobs.filter((job) => job.status === "done")
+        : jobs;
+
+    return [...visibleJobs].sort(compareJobsByNewest);
   }, [jobs, listFilter]);
 
   const hasQueuedOrProcessingJobs = useMemo(
