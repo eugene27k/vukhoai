@@ -248,12 +248,14 @@ if missing:
   $hadPythonPath = Test-Path Env:\PYTHONPATH
   $oldPythonHome = $env:PYTHONHOME
   $oldPythonPath = $env:PYTHONPATH
+  $tempScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ("vukhoai-python-check-" + [System.IO.Path]::GetRandomFileName() + ".py")
 
   try {
     Remove-Item Env:\PYTHONHOME -ErrorAction SilentlyContinue
     Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
 
-    $output = & $PythonExe -c $script 2>&1
+    Set-Content -Path $tempScriptPath -Value $script -Encoding ASCII
+    $output = & $PythonExe $tempScriptPath 2>&1
     if ($LASTEXITCODE -ne 0) {
       $detail = ($output | Out-String).Trim()
       if ([string]::IsNullOrWhiteSpace($detail)) {
@@ -275,6 +277,8 @@ if missing:
     } else {
       Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
     }
+
+    Remove-Item $tempScriptPath -Force -ErrorAction SilentlyContinue
   }
 }
 

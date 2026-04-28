@@ -424,11 +424,13 @@ print("Validated modules: " + ", ".join(modules))
   $hadPythonPath = Test-Path Env:\PYTHONPATH
   $oldPythonHome = $env:PYTHONHOME
   $oldPythonPath = $env:PYTHONPATH
+  $tempScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ("vukhoai-python-check-" + [System.IO.Path]::GetRandomFileName() + ".py")
 
   try {
     Remove-Item Env:\PYTHONHOME -ErrorAction SilentlyContinue
     Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
-    Invoke-NativeCommand -FilePath $PythonExe -ArgumentList @("-c", $script)
+    Set-Content -Path $tempScriptPath -Value $script -Encoding ASCII
+    Invoke-NativeCommand -FilePath $PythonExe -ArgumentList @($tempScriptPath)
   }
   finally {
     if ($hadPythonHome) {
@@ -442,6 +444,8 @@ print("Validated modules: " + ", ".join(modules))
     } else {
       Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
     }
+
+    Remove-Item $tempScriptPath -Force -ErrorAction SilentlyContinue
   }
 }
 
