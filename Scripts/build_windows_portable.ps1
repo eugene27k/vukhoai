@@ -135,10 +135,18 @@ function Invoke-NativeCommand {
     [string[]]$ArgumentList = @()
   )
 
-  & $FilePath @ArgumentList
-  if ($LASTEXITCODE -ne 0) {
+  $output = & $FilePath @ArgumentList 2>&1
+  $exitCode = $LASTEXITCODE
+
+  if ($null -ne $output) {
+    foreach ($line in $output) {
+      Write-Host $line
+    }
+  }
+
+  if ($exitCode -ne 0) {
     $joinedArgs = ($ArgumentList | ForEach-Object { $_ }) -join " "
-    throw ("Command failed with exit code {0}: {1} {2}" -f $LASTEXITCODE, $FilePath, $joinedArgs).Trim()
+    throw ("Command failed with exit code {0}: {1} {2}" -f $exitCode, $FilePath, $joinedArgs).Trim()
   }
 }
 
