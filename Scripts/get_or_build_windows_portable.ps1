@@ -8,6 +8,7 @@ Param(
 )
 
 $ErrorActionPreference = "Stop"
+$prepareProgressActivity = "Preparing Windows portable app"
 
 function Test-IsWindowsHost {
   if (Get-Variable -Name "IsWindows" -ErrorAction SilentlyContinue) {
@@ -30,6 +31,95 @@ function Test-CommandExists {
   return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+function Format-ByteSize {
+  param([Int64]$Bytes)
+
+  if ($Bytes -lt 0) {
+    return "0 B"
+  }
+
+  $units = @("B", "KB", "MB", "GB", "TB")
+  $value = [double]$Bytes
+  $unitIndex = 0
+
+  while ($value -ge 1024 -and $unitIndex -lt ($units.Length - 1)) {
+    $value /= 1024
+    $unitIndex++
+  }
+
+  if ($unitIndex -eq 0) {
+    return "{0} {1}" -f [Int64][Math]::Round($value), $units[$unitIndex]
+  }
+
+  return "{0:N1} {1}" -f $value, $units[$unitIndex]
+}
+
+function Format-Duration {
+  param([TimeSpan]$Duration)
+
+  if ($Duration.TotalHours -ge 1) {
+    return $Duration.ToString("hh\:mm\:ss")
+  }
+
+  return $Duration.ToString("mm\:ss")
+}
+
+function Update-DownloadProgress {
+  param(
+    [string]$Activity,
+    [Int64]$BytesReceived,
+    $TotalBytes,
+    [TimeSpan]$Elapsed,
+    [int]$ProgressId = 1
+  )
+
+  $speedBytesPerSecond = 0.0
+  if ($Elapsed.TotalSeconds -gt 0) {
+    $speedBytesPerSecond = $BytesReceived / $Elapsed.TotalSeconds
+  }
+
+  $speedText = if ($speedBytesPerSecond -gt 0) {
+    "{0}/s" -f (Format-ByteSize -Bytes ([Int64][Math]::Round($speedBytesPerSecond)))
+  } else {
+    "calculating speed..."
+  }
+
+  $progress = @{
+    Id = $ProgressId
+    Activity = $Activity
+  }
+
+  if ($null -ne $TotalBytes -and $TotalBytes -gt 0) {
+    $percentComplete = [Math]::Min([Math]::Round(($BytesReceived * 100.0) / $TotalBytes), 100)
+    $status = "{0} of {1} ({2}%) at {3}" -f `
+      (Format-ByteSize -Bytes $BytesReceived), `
+      (Format-ByteSize -Bytes $TotalBytes), `
+      $percentComplete, `
+      $speedText
+
+    if ($speedBytesPerSecond -gt 0 -and $BytesReceived -lt $TotalBytes) {
+      $remainingSeconds = ($TotalBytes - $BytesReceived) / $speedBytesPerSecond
+      $status += ", ETA $(Format-Duration -Duration ([TimeSpan]::FromSeconds([Math]::Max($remainingSeconds, 0))))"
+    }
+
+    $progress.Status = $status
+    $progress.PercentComplete = [int]$percentComplete
+  } else {
+    $progress.Status = "{0} downloaded at {1}" -f (Format-ByteSize -Bytes $BytesReceived), $speedText
+  }
+
+  Write-Progress @progress
+}
+
+function Write-PrepareProgress {
+  param(
+    [string]$Status,
+    [int]$PercentComplete
+  )
+
+  Write-Progress -Id 0 -Activity $prepareProgressActivity -Status $Status -PercentComplete $PercentComplete
+}
+
 function Test-LocalBuildPrerequisites {
   $hasPython = (Test-CommandExists "py") -or (Test-CommandExists "python")
   return (Test-CommandExists "cargo") -and (Test-CommandExists "npm") -and $hasPython
@@ -41,19 +131,71 @@ function Invoke-PortableDownload {
     [string]$OutFile
   )
 
-  $request = @{
-    Uri = $Uri
-    OutFile = $OutFile
-    Headers = @{
-      "User-Agent" = "VukhoAI-Windows-Bootstrap"
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  Add-Type -AssemblyName System.Net.Http
+
+  $httpHandler = New-Object System.Net.Http.HttpClientHandler
+  $httpHandler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+  $httpClient = New-Object System.Net.Http.HttpClient($httpHandler)
+  $httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("VukhoAI-Windows-Bootstrap")
+
+  $response = $null
+  $inputStream = $null
+  $outputStream = $null
+
+  try {
+    $response = $httpClient.GetAsync($Uri, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+    [void]$response.EnsureSuccessStatusCode()
+
+    $totalBytes = $response.Content.Headers.ContentLength
+    $inputStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+    $outputStream = [System.IO.File]::Open($OutFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+
+    $buffer = New-Object byte[] 262144
+    $bytesReceived = 0L
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastProgressUpdate = [TimeSpan]::FromSeconds(-1)
+
+    while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+      $outputStream.Write($buffer, 0, $read)
+      $bytesReceived += $read
+
+      if (($stopwatch.Elapsed - $lastProgressUpdate).TotalMilliseconds -ge 200) {
+        Update-DownloadProgress `
+          -Activity "Downloading ready-made Windows build" `
+          -BytesReceived $bytesReceived `
+          -TotalBytes $totalBytes `
+          -Elapsed $stopwatch.Elapsed `
+          -ProgressId 1
+        $lastProgressUpdate = $stopwatch.Elapsed
+      }
     }
-  }
 
-  if ($PSVersionTable.PSVersion.Major -lt 6) {
-    $request.UseBasicParsing = $true
+    Update-DownloadProgress `
+      -Activity "Downloading ready-made Windows build" `
+      -BytesReceived $bytesReceived `
+      -TotalBytes $totalBytes `
+      -Elapsed $stopwatch.Elapsed `
+      -ProgressId 1
   }
+  finally {
+    Write-Progress -Id 1 -Activity "Downloading ready-made Windows build" -Completed
 
-  Invoke-WebRequest @request | Out-Null
+    if ($null -ne $outputStream) {
+      $outputStream.Dispose()
+    }
+
+    if ($null -ne $inputStream) {
+      $inputStream.Dispose()
+    }
+
+    if ($null -ne $response) {
+      $response.Dispose()
+    }
+
+    $httpClient.Dispose()
+    $httpHandler.Dispose()
+  }
 }
 
 function Resolve-PortableExe {
@@ -65,13 +207,123 @@ function Resolve-PortableExe {
     Select-Object -First 1
 }
 
+function Test-PortablePythonModules {
+  param(
+    [string]$PythonExe,
+    [string[]]$RequiredModules,
+    [string]$Label
+  )
+
+  if (-not (Test-Path $PythonExe)) {
+    throw "$Label was not found: $PythonExe"
+  }
+
+  $moduleList = ($RequiredModules | ForEach-Object {
+    '"' + ($_ -replace '\\', '\\' -replace '"', '\"') + '"'
+  }) -join ", "
+
+  $script = @"
+import importlib
+import sys
+
+modules = [$moduleList]
+
+def has_module(name):
+    try:
+        if name == "faster_whisper":
+            from faster_whisper import WhisperModel  # noqa: F401
+            return True
+        importlib.import_module(name)
+        return True
+    except Exception:
+        return False
+
+missing = [name for name in modules if not has_module(name)]
+if missing:
+    print("Missing modules: " + ", ".join(missing), file=sys.stderr)
+    sys.exit(1)
+"@
+
+  $hadPythonHome = Test-Path Env:\PYTHONHOME
+  $hadPythonPath = Test-Path Env:\PYTHONPATH
+  $oldPythonHome = $env:PYTHONHOME
+  $oldPythonPath = $env:PYTHONPATH
+
+  try {
+    Remove-Item Env:\PYTHONHOME -ErrorAction SilentlyContinue
+    Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
+
+    $output = & $PythonExe -c $script 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      $detail = ($output | Out-String).Trim()
+      if ([string]::IsNullOrWhiteSpace($detail)) {
+        throw "$Label is present but its Python packages are not ready."
+      }
+
+      throw "$Label is present but its Python packages are not ready. $detail"
+    }
+  }
+  finally {
+    if ($hadPythonHome) {
+      $env:PYTHONHOME = $oldPythonHome
+    } else {
+      Remove-Item Env:\PYTHONHOME -ErrorAction SilentlyContinue
+    }
+
+    if ($hadPythonPath) {
+      $env:PYTHONPATH = $oldPythonPath
+    } else {
+      Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
+    }
+  }
+}
+
+function Assert-PortablePackageReady {
+  param([string]$PortableRoot)
+
+  $portableExe = Resolve-PortableExe -PortableRoot $PortableRoot
+  if ($null -eq $portableExe) {
+    throw "The package does not contain a runnable .exe."
+  }
+
+  $transcribeScript = Join-Path $PortableRoot "resources\transcribe.py"
+  if (-not (Test-Path $transcribeScript)) {
+    throw "The package is missing resources\transcribe.py."
+  }
+
+  $embeddedPython = Join-Path $PortableRoot "python\python.exe"
+  if (-not (Test-Path $embeddedPython)) {
+    $legacyVenv = Join-Path $PortableRoot ".venv\Scripts\python.exe"
+    if (Test-Path $legacyVenv) {
+      throw "The downloaded package uses the legacy .venv layout. A rebuilt package with embedded Python is required."
+    }
+
+    throw "The package is missing the embedded transcription runtime (python\python.exe)."
+  }
+
+  Test-PortablePythonModules `
+    -PythonExe $embeddedPython `
+    -RequiredModules @("faster_whisper") `
+    -Label "Embedded transcription runtime"
+
+  $diarizationPython = Join-Path $PortableRoot "python-diarization\python.exe"
+  if (Test-Path $diarizationPython) {
+    Test-PortablePythonModules `
+      -PythonExe $diarizationPython `
+      -RequiredModules @("faster_whisper", "whisperx", "pyannote.audio") `
+      -Label "Embedded diarization runtime"
+  }
+
+  return $portableExe
+}
+
 if (-not (Test-IsWindowsHost)) {
   throw "This script must be run on Windows."
 }
 
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Resolve-Path (Join-Path $scriptRoot "..")
-$appRoot = Join-Path $repoRoot "ghostmic-cross"
+$appRoot = Join-Path $repoRoot "vukhoai-cross"
 $downloadRoot = Join-Path $appRoot "portable-build\downloads"
 $windowsRoot = Join-Path $appRoot "portable-build\windows"
 $portableRoot = Join-Path $windowsRoot "Vukho.AI-Windows-Portable"
@@ -87,6 +339,7 @@ if (-not $ForceLocalBuild) {
   Write-Step "Checking for the latest ready-to-run Windows build..."
 
   try {
+    Write-PrepareProgress -Status "Preparing download folder..." -PercentComplete 5
     New-Item -ItemType Directory -Force -Path $downloadRoot | Out-Null
     New-Item -ItemType Directory -Force -Path $windowsRoot | Out-Null
 
@@ -94,19 +347,20 @@ if (-not $ForceLocalBuild) {
       Remove-Item $zipPath -Force
     }
 
+    Write-PrepareProgress -Status "Downloading ready-made Windows build..." -PercentComplete 15
     Invoke-PortableDownload -Uri $releaseUrl -OutFile $zipPath
 
     if (Test-Path $portableRoot) {
       Remove-Item $portableRoot -Recurse -Force
     }
 
+    Write-PrepareProgress -Status "Expanding downloaded archive..." -PercentComplete 80
     Expand-Archive -Path $zipPath -DestinationPath $windowsRoot -Force
 
-    $portableExe = Resolve-PortableExe -PortableRoot $portableRoot
-    if ($null -eq $portableExe) {
-      throw "The downloaded archive did not contain a runnable .exe."
-    }
+    Write-PrepareProgress -Status "Validating extracted Windows app..." -PercentComplete 92
+    $portableExe = Assert-PortablePackageReady -PortableRoot $portableRoot
 
+    Write-PrepareProgress -Status "Windows portable app is ready." -PercentComplete 100
     Write-Host "Ready-to-run Windows app downloaded successfully."
     Write-Host "Path: $portableRoot"
 
@@ -118,10 +372,12 @@ if (-not $ForceLocalBuild) {
 
     exit 0
   } catch {
-    Write-Warning "Prebuilt Windows app download failed: $($_.Exception.Message)"
+    Write-Progress -Id 1 -Activity "Downloading ready-made Windows build" -Completed
+    Write-Progress -Id 0 -Activity $prepareProgressActivity -Completed
+    Write-Warning "Prebuilt Windows app download or validation failed: $($_.Exception.Message)"
 
     if ($ForceDownload) {
-      throw "Could not download the prebuilt Windows app. Try again later or install local build prerequisites."
+      throw "Could not prepare a valid prebuilt Windows app. Try again later or install local build prerequisites."
     }
   }
 }
@@ -137,4 +393,5 @@ To continue, choose one of these paths:
 }
 
 Write-Step "Falling back to a local Windows build from source..."
+Write-Progress -Id 0 -Activity $prepareProgressActivity -Completed
 & $localBuildScript -OpenFolder:$OpenFolder

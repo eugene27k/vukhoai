@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct GhostMicApp: App {
+struct VukhoAIApp: App {
     @StateObject private var settings: AppSettings
     @StateObject private var jobStore: JobStore
     @StateObject private var queueProcessor: QueueProcessor

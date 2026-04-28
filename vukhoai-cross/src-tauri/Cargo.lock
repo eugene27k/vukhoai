@@ -1213,7 +1213,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ghostmic-cross"
+name = "vukhoai-cross"
 version = "0.1.0"
 dependencies = [
  "chrono",

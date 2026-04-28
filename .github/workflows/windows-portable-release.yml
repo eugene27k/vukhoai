@@ -9,7 +9,7 @@ on:
       - ".github/workflows/windows-portable-release.yml"
       - "Build Windows Portable.cmd"
       - "Scripts/**"
-      - "ghostmic-cross/**"
+      - "vukhoai-cross/**"
 
 permissions:
   contents: write
@@ -30,7 +30,7 @@ jobs:
         with:
           node-version: "20"
           cache: "npm"
-          cache-dependency-path: ghostmic-cross/package-lock.json
+          cache-dependency-path: vukhoai-cross/package-lock.json
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -42,7 +42,7 @@ jobs:
 
       - name: Seed portable settings from repository secrets
         run: |
-          $portableDir = Join-Path $PWD "ghostmic-cross\portable-build"
+          $portableDir = Join-Path $PWD "vukhoai-cross\portable-build"
           New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
 
           $settings = @{
@@ -74,8 +74,8 @@ jobs:
 
       - name: Package release ZIP
         run: |
-          $portableRoot = Join-Path $PWD "ghostmic-cross\portable-build\windows\Vukho.AI-Windows-Portable"
-          $zipPath = Join-Path $PWD "ghostmic-cross\portable-build\windows\Vukho.AI-Windows-Portable.zip"
+          $portableRoot = Join-Path $PWD "vukhoai-cross\portable-build\windows\Vukho.AI-Windows-Portable"
+          $zipPath = Join-Path $PWD "vukhoai-cross\portable-build\windows\Vukho.AI-Windows-Portable.zip"
 
           if (Test-Path $zipPath) {
             Remove-Item $zipPath -Force
@@ -87,7 +87,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Vukho.AI-Windows-Portable
-          path: ghostmic-cross/portable-build/windows/Vukho.AI-Windows-Portable.zip
+          path: vukhoai-cross/portable-build/windows/Vukho.AI-Windows-Portable.zip
           if-no-files-found: error
 
       - name: Publish stable release ZIP
@@ -95,7 +95,7 @@ jobs:
         with:
           allowUpdates: true
           artifactErrorsFailBuild: true
-          artifacts: ghostmic-cross/portable-build/windows/Vukho.AI-Windows-Portable.zip
+          artifacts: vukhoai-cross/portable-build/windows/Vukho.AI-Windows-Portable.zip
           body: |
             Latest ready-to-run portable Windows build for Vukho.AI.
 

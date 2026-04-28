@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 
-APP_IDENTIFIER = "com.admin.ghostmic-cross"
+APP_IDENTIFIER = "com.admin.vukhoai-cross"
 
 
 def repo_root() -> Path:
@@ -32,7 +32,7 @@ def default_source_state() -> Path:
 
 
 def default_output_state() -> Path:
-    return repo_root() / "ghostmic-cross" / "portable-build" / "portable-state.local.json"
+    return repo_root() / "vukhoai-cross" / "portable-build" / "portable-state.local.json"
 
 
 def sanitize_state(raw: dict[str, Any]) -> dict[str, Any]:
@@ -59,7 +59,7 @@ def sanitize_state(raw: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Export current GhostMic settings into a portable first-run seed file.",
+        description="Export current Vukho.AI settings into a portable first-run seed file.",
     )
     parser.add_argument(
         "--source",

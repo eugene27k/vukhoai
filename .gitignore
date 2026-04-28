@@ -5,6 +5,6 @@ DerivedData/
 .venv/
 .venv-diarization/
 
-Sources/GhostMicApp/Resources/__pycache__/
-ghostmic-cross/src-tauri/resources/__pycache__/
+Sources/VukhoAIApp/Resources/__pycache__/
+vukhoai-cross/src-tauri/resources/__pycache__/
 Scripts/__pycache__/

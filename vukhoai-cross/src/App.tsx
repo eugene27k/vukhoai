@@ -77,9 +77,9 @@ interface AppSnapshot {
 type ListFilter = "all" | "completed_only";
 type RuntimeTone = "gpu" | "cpu" | "detecting";
 
-const JOBS_EVENT = "ghostmic://jobs-updated";
-const SETTINGS_EVENT = "ghostmic://settings-updated";
-const THEME_STORAGE_KEY = "ghostmic.theme_mode";
+const JOBS_EVENT = "vukhoai://jobs-updated";
+const SETTINGS_EVENT = "vukhoai://settings-updated";
+const THEME_STORAGE_KEY = "vukhoai.theme_mode";
 
 const profileLabels: Record<Profile, string> = {
   maximum_quality: "Maximum Quality",
@@ -1037,7 +1037,7 @@ function App() {
                       python_path: e.target.value,
                     })
                   }
-                  placeholder="Leave empty to use python3/python"
+                  placeholder="Leave empty to use the bundled or auto-detected runtime"
                 />
               </label>
 
@@ -1052,7 +1052,7 @@ function App() {
                       diarization_python_path: e.target.value,
                     })
                   }
-                  placeholder="Recommended: separate Python 3.11/3.12 env with whisperx + pyannote"
+                  placeholder="Optional advanced override for speaker diarization"
                 />
               </label>
 
@@ -1101,8 +1101,9 @@ function App() {
             </div>
 
             <div className="settings-note">
-              Speaker diarization needs a Python env with `whisperx` + `pyannote.audio`.
-              The app will auto-try `.venv-diarization`, but you can point to any ready env here.
+              Most users should leave both Python fields empty. The app will prefer the bundled
+              runtime when available and otherwise auto-detect a working Python environment. Only
+              set a diarization Python path if you intentionally manage a separate advanced runtime.
             </div>
 
             {settingsStatus && <div className="banner ok">{settingsStatus}</div>}

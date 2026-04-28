@@ -13,8 +13,8 @@ use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
-const JOBS_EVENT: &str = "ghostmic://jobs-updated";
-const SETTINGS_EVENT: &str = "ghostmic://settings-updated";
+const JOBS_EVENT: &str = "vukhoai://jobs-updated";
+const SETTINGS_EVENT: &str = "vukhoai://settings-updated";
 const PORTABLE_STATE_FILE_NAME: &str = "portable-state.json";
 const STATE_SCHEMA_VERSION: u32 = 2;
 const MAX_PERFORMANCE_LOG_ENTRIES: usize = 80;
@@ -1437,10 +1437,7 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
 }
 
 fn apply_runtime_line(shared: &AppShared, job_id: &str, line: &str) -> bool {
-    if let Some(payload) = line
-        .strip_prefix("VUKHOAI_DIAG ")
-        .or_else(|| line.strip_prefix("GHOSTMIC_DIAG "))
-    {
+    if let Some(payload) = line.strip_prefix("VUKHOAI_DIAG ") {
         let parsed = serde_json::from_str::<DiagnosticPayload>(payload);
         let Ok(diagnostic) = parsed else {
             return false;
@@ -1462,10 +1459,7 @@ fn apply_runtime_line(shared: &AppShared, job_id: &str, line: &str) -> bool {
         return true;
     }
 
-    if let Some(payload) = line
-        .strip_prefix("VUKHOAI_RUNTIME ")
-        .or_else(|| line.strip_prefix("GHOSTMIC_RUNTIME "))
-    {
+    if let Some(payload) = line.strip_prefix("VUKHOAI_RUNTIME ") {
         let parsed = serde_json::from_str::<RuntimePayload>(payload);
         let Ok(runtime) = parsed else {
             return false;
@@ -1538,10 +1532,7 @@ fn apply_runtime_line(shared: &AppShared, job_id: &str, line: &str) -> bool {
         return true;
     }
 
-    if let Some(payload) = line
-        .strip_prefix("VUKHOAI_NOTICE ")
-        .or_else(|| line.strip_prefix("GHOSTMIC_NOTICE "))
-    {
+    if let Some(payload) = line.strip_prefix("VUKHOAI_NOTICE ") {
         let parsed = serde_json::from_str::<NoticePayload>(payload);
         let Ok(notice) = parsed else {
             return false;
@@ -1562,10 +1553,7 @@ fn apply_runtime_line(shared: &AppShared, job_id: &str, line: &str) -> bool {
         return true;
     }
 
-    let Some(payload) = line
-        .strip_prefix("VUKHOAI_PROGRESS ")
-        .or_else(|| line.strip_prefix("GHOSTMIC_PROGRESS "))
-    else {
+    let Some(payload) = line.strip_prefix("VUKHOAI_PROGRESS ") else {
         return false;
     };
 
@@ -1785,12 +1773,6 @@ fn resolve_python_binary(
                 candidates.push(env_python);
             }
         }
-
-        if let Ok(env_python) = std::env::var("GHOSTMIC_DIARIZATION_PYTHON") {
-            if !env_python.trim().is_empty() {
-                candidates.push(env_python);
-            }
-        }
     }
 
     if let Some(value) = settings
@@ -1803,12 +1785,6 @@ fn resolve_python_binary(
     }
 
     if let Ok(env_python) = std::env::var("VUKHOAI_PYTHON") {
-        if !env_python.trim().is_empty() {
-            candidates.push(env_python);
-        }
-    }
-
-    if let Ok(env_python) = std::env::var("GHOSTMIC_PYTHON") {
         if !env_python.trim().is_empty() {
             candidates.push(env_python);
         }
@@ -2043,10 +2019,6 @@ fn default_output_directory() -> PathBuf {
     documents_directory().join("VukhoAI").join("Exports")
 }
 
-fn legacy_default_output_directory() -> PathBuf {
-    documents_directory().join("GhostMic").join("Exports")
-}
-
 fn documents_directory() -> PathBuf {
     dirs::document_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
@@ -2055,11 +2027,6 @@ fn documents_directory() -> PathBuf {
 fn migrate_output_folder_path_if_needed(path: &str) -> String {
     let trimmed = path.trim();
     if trimmed.is_empty() {
-        return default_output_directory().to_string_lossy().into_owned();
-    }
-
-    let candidate = PathBuf::from(trimmed);
-    if candidate == legacy_default_output_directory() {
         return default_output_directory().to_string_lossy().into_owned();
     }
 
@@ -2306,7 +2273,7 @@ fn resolve_script_path(app: &tauri::App) -> Result<PathBuf, String> {
             .join("..")
             .join("..")
             .join("Sources")
-            .join("GhostMicApp")
+            .join("VukhoAIApp")
             .join("Resources")
             .join("transcribe.py"),
     );
@@ -2483,7 +2450,7 @@ fn build_job_notice(core: &AppCore, meta_path: &str) -> Option<String> {
     if missing_stack {
         message.push(' ');
         message.push_str(
-            "Install whisperx + pyannote into a separate Python 3.11/3.12 env, then set Settings -> Diarization Python.",
+            "Speaker diarization runtime is unavailable. Transcription still finished, but without speaker separation. Reinstall the Windows package, or if you manage your own Python runtimes, choose a working diarization runtime in Settings.",
         );
     }
 

@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    ghostmic_cross_lib::run()
+    vukhoai_cross_lib::run()
 }

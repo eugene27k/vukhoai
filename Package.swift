@@ -7,11 +7,11 @@ let package = Package(
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "VukhoAI", targets: ["GhostMicApp"])
+        .executable(name: "VukhoAI", targets: ["VukhoAIApp"])
     ],
     targets: [
         .executableTarget(
-            name: "GhostMicApp",
+            name: "VukhoAIApp",
             exclude: [
                 "Resources/__pycache__"
             ],

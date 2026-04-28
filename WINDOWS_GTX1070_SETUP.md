@@ -1,6 +1,6 @@
 # Windows GTX 1070 Setup Checklist
 
-This checklist is for running GhostMic on a Windows machine with an NVIDIA GTX 1070 and enabling GPU-accelerated transcription when possible.
+This checklist is for running Vukho.AI on a Windows machine with an NVIDIA GTX 1070 and enabling GPU-accelerated transcription when possible.
 
 ## 1. Install system prerequisites
 
@@ -32,7 +32,7 @@ Official reference:
 From the repository root:
 
 ```powershell
-cd "C:\path\to\GhostMic"
+cd "C:\path\to\Vukho.AI"
 py -3.11 -m venv .venv
 .venv\Scripts\activate
 python -m pip install --upgrade pip
@@ -84,7 +84,7 @@ This is an engineering recommendation based on typical Pascal-generation GPU com
 If you want real speaker diarization with WhisperX and pyannote, use a separate environment:
 
 ```powershell
-cd "C:\path\to\GhostMic"
+cd "C:\path\to\Vukho.AI"
 py -3.11 -m venv .venv-diarization
 .venv-diarization\Scripts\activate
 python -m pip install --upgrade pip
@@ -113,27 +113,27 @@ For diarization, do all of the following:
 - request or accept access for `pyannote/speaker-diarization-community-1`
 - create a Hugging Face token with read access
 
-Then store the token in GhostMic settings.
+Then store the token in Vukho.AI settings.
 
-## 9. Configure GhostMic settings
+## 9. Configure Vukho.AI settings
 
 In the app, set:
 
-- `Python path` -> `C:\path\to\GhostMic\.venv\Scripts\python.exe`
-- `Diarization Python` -> `C:\path\to\GhostMic\.venv-diarization\Scripts\python.exe`
+- `Python path` -> `C:\path\to\Vukho.AI\.venv\Scripts\python.exe`
+- `Diarization Python` -> `C:\path\to\Vukho.AI\.venv-diarization\Scripts\python.exe`
 - `Hugging Face token` -> your token
 
 ## 10. Run the Tauri app in development
 
 ```powershell
-cd "C:\path\to\GhostMic\ghostmic-cross"
+cd "C:\path\to\Vukho.AI\vukhoai-cross"
 npm install
 npm run tauri dev
 ```
 
-## 11. How GhostMic uses the GPU
+## 11. How Vukho.AI uses the GPU
 
-GhostMic currently auto-detects NVIDIA CUDA in the Python transcription pipeline:
+Vukho.AI currently auto-detects NVIDIA CUDA in the Python transcription pipeline:
 
 - `faster-whisper` uses `ctranslate2` CUDA detection
 - `whisperx` uses `torch.cuda.is_available()`
@@ -165,7 +165,7 @@ Check these in order:
 1. NVIDIA drivers are installed and up to date.
 2. `torch.cuda.is_available()` returns `True` in the exact environment used by the app.
 3. The environment contains a CUDA-enabled PyTorch build, not a CPU-only one.
-4. GhostMic settings point to the correct `python.exe`.
+4. Vukho.AI settings point to the correct `python.exe`.
 5. The diarization environment is separate and correctly configured.
 
 ## References
