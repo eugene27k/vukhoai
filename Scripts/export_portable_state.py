@@ -40,7 +40,8 @@ def sanitize_state(raw: dict[str, Any]) -> dict[str, Any]:
     portable_settings = {
         "default_profile": settings.get("default_profile", "maximum_quality"),
         "language_mode": settings.get("language_mode", "auto"),
-        "diarization_enabled": bool(settings.get("diarization_enabled", True)),
+        # Portable Windows builds should default to the fast transcription path.
+        "diarization_enabled": False,
         # Leave machine-specific paths empty so the portable build can auto-detect bundled runtimes.
         "output_folder_path": "",
         "python_path": None,

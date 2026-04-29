@@ -48,7 +48,7 @@ jobs:
           $settings = @{
             default_profile = "maximum_quality"
             language_mode = "auto"
-            diarization_enabled = $true
+            diarization_enabled = $false
             output_folder_path = ""
             python_path = $null
             diarization_python_path = $null

@@ -41,7 +41,7 @@ final class AppSettings: ObservableObject {
         let defaults = UserDefaults.standard
         defaultProfile = TranscriptionProfile(rawValue: defaults.string(forKey: Keys.profile) ?? "") ?? .maximumQuality
         languageMode = LanguageMode(rawValue: defaults.string(forKey: Keys.languageMode) ?? "") ?? .ukrainian
-        diarizationEnabled = defaults.object(forKey: Keys.diarizationEnabled) as? Bool ?? true
+        diarizationEnabled = defaults.object(forKey: Keys.diarizationEnabled) as? Bool ?? false
         openAIModel = defaults.string(forKey: Keys.openAIModel) ?? "gpt-4o-mini"
 
         let resolvedOutputFolderPath: String

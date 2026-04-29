@@ -16,7 +16,7 @@ use uuid::Uuid;
 const JOBS_EVENT: &str = "vukhoai://jobs-updated";
 const SETTINGS_EVENT: &str = "vukhoai://settings-updated";
 const PORTABLE_STATE_FILE_NAME: &str = "portable-state.json";
-const STATE_SCHEMA_VERSION: u32 = 2;
+const STATE_SCHEMA_VERSION: u32 = 3;
 const MAX_PERFORMANCE_LOG_ENTRIES: usize = 80;
 const PERFORMANCE_GAP_WARNING_SECONDS: i64 = 15 * 60;
 const PERFORMANCE_PROGRESS_MILESTONE_STEP: f64 = 25.0;
@@ -161,7 +161,7 @@ impl AppSettings {
         Self {
             default_profile: TranscriptionProfile::MaximumQuality,
             language_mode: LanguageMode::Ukrainian,
-            diarization_enabled: true,
+            diarization_enabled: false,
             output_folder_path: default_output_directory().to_string_lossy().into_owned(),
             python_path: None,
             diarization_python_path: None,
@@ -2404,6 +2404,22 @@ fn migrate_persisted_state(persisted: &mut PersistedState) {
             persisted.settings.language_mode = LanguageMode::Ukrainian;
         }
         persisted.schema_version = 2;
+    }
+
+    if persisted.schema_version < 3 {
+        let diarization_python_missing = persisted
+            .settings
+            .diarization_python_path
+            .as_deref()
+            .map(str::trim)
+            .map(|value| value.is_empty())
+            .unwrap_or(true);
+
+        if diarization_python_missing {
+            persisted.settings.diarization_enabled = false;
+        }
+
+        persisted.schema_version = 3;
     }
 
     if persisted.schema_version < STATE_SCHEMA_VERSION {
