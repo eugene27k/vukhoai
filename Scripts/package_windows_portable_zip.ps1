@@ -30,6 +30,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $files = Get-ChildItem -Path $sourceRootPath -Recurse -File
 $sourcePrefix = $sourceRootPath.TrimEnd('\', '/')
+$rootEntryName = Split-Path -Leaf $sourceRootPath
 $zipStream = [System.IO.File]::Open($zipDestination, [System.IO.FileMode]::CreateNew)
 
 try {
@@ -44,7 +45,7 @@ try {
     foreach ($file in $files) {
       $index += 1
       $entryName = $file.FullName.Substring($sourcePrefix.Length).TrimStart('\', '/')
-      $entryName = $entryName -replace '\\', '/'
+      $entryName = (($rootEntryName + "\" + $entryName) -replace '\\', '/')
 
       if ([string]::IsNullOrWhiteSpace($entryName)) {
         continue

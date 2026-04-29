@@ -265,6 +265,32 @@ function Join-PortableReleaseParts {
   }
 }
 
+function Repair-PortableLayoutIfNeeded {
+  param(
+    [string]$WindowsRoot,
+    [string]$PortableRoot
+  )
+
+  if (Test-Path $PortableRoot) {
+    return
+  }
+
+  $flatExe = Resolve-PortableExe -PortableRoot $WindowsRoot
+  $flatScript = Join-Path $WindowsRoot "resources\transcribe.py"
+  if ($null -eq $flatExe -or -not (Test-Path $flatScript)) {
+    return
+  }
+
+  New-Item -ItemType Directory -Force -Path $PortableRoot | Out-Null
+  $portableRootFull = (Resolve-Path $PortableRoot).Path
+
+  Get-ChildItem -Path $WindowsRoot -Force |
+    Where-Object { $_.FullName -ne $portableRootFull } |
+    ForEach-Object {
+      Move-Item -LiteralPath $_.FullName -Destination (Join-Path $PortableRoot $_.Name) -Force
+    }
+}
+
 function Resolve-PortableExe {
   param([string]$PortableRoot)
 
@@ -574,6 +600,7 @@ if (-not $ForceLocalBuild) {
 
     Write-PrepareProgress -Status "Expanding downloaded archive..." -PercentComplete 80
     Expand-Archive -Path $zipPath -DestinationPath $windowsRoot -Force
+    Repair-PortableLayoutIfNeeded -WindowsRoot $windowsRoot -PortableRoot $portableRoot
 
     Write-PrepareProgress -Status "Validating extracted Windows app..." -PercentComplete 92
     $portableExe = Assert-PortablePackageReady -PortableRoot $portableRoot
