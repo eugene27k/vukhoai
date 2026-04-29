@@ -249,15 +249,37 @@ if missing:
   $oldPythonHome = $env:PYTHONHOME
   $oldPythonPath = $env:PYTHONPATH
   $tempScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ("vukhoai-python-check-" + [System.IO.Path]::GetRandomFileName() + ".py")
+  $stdoutPath = Join-Path ([System.IO.Path]::GetTempPath()) ("vukhoai-python-check-" + [System.IO.Path]::GetRandomFileName() + ".out")
+  $stderrPath = Join-Path ([System.IO.Path]::GetTempPath()) ("vukhoai-python-check-" + [System.IO.Path]::GetRandomFileName() + ".err")
 
   try {
     Remove-Item Env:\PYTHONHOME -ErrorAction SilentlyContinue
     Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
 
     Set-Content -Path $tempScriptPath -Value $script -Encoding ASCII
-    $output = & $PythonExe $tempScriptPath 2>&1
-    if ($LASTEXITCODE -ne 0) {
-      $detail = ($output | Out-String).Trim()
+    $process = Start-Process `
+      -FilePath $PythonExe `
+      -ArgumentList @($tempScriptPath) `
+      -NoNewWindow `
+      -Wait `
+      -PassThru `
+      -RedirectStandardOutput $stdoutPath `
+      -RedirectStandardError $stderrPath
+
+    $stdoutText = if (Test-Path $stdoutPath) { [System.IO.File]::ReadAllText($stdoutPath) } else { "" }
+    $stderrText = if (Test-Path $stderrPath) { [System.IO.File]::ReadAllText($stderrPath) } else { "" }
+
+    if (-not [string]::IsNullOrWhiteSpace($stdoutText)) {
+      Write-Host $stdoutText.TrimEnd()
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($stderrText)) {
+      Write-Host $stderrText.TrimEnd()
+    }
+
+    if ($process.ExitCode -ne 0) {
+      $detail = @($stdoutText, $stderrText) -join [Environment]::NewLine
+      $detail = $detail.Trim()
       if ([string]::IsNullOrWhiteSpace($detail)) {
         throw "$Label is present but its Python packages are not ready."
       }
@@ -279,6 +301,8 @@ if missing:
     }
 
     Remove-Item $tempScriptPath -Force -ErrorAction SilentlyContinue
+    Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue
+    Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue
   }
 }
 
