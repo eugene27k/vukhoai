@@ -631,6 +631,12 @@ function New-PortablePythonRuntime {
     -Destination $runtimeRoot `
     -DownloadRoot $DownloadRoot
 
+  Write-BuildProgress -Status "Installing Python packages for $RuntimeName" -PercentComplete $InstallPercent
+  Install-TargetRequirements `
+    -BuildPython $BuildPython `
+    -TargetPythonRoot $runtimeRoot `
+    -RequirementsPath $RequirementsPath
+
   if ($PreInstallPackages.Count -gt 0) {
     Write-Step "Installing pinned runtime packages for $RuntimeName"
     Install-TargetPackages `
@@ -639,12 +645,6 @@ function New-PortablePythonRuntime {
       -Packages $PreInstallPackages `
       -IndexUrl $PreInstallIndexUrl
   }
-
-  Write-BuildProgress -Status "Installing Python packages for $RuntimeName" -PercentComplete $InstallPercent
-  Install-TargetRequirements `
-    -BuildPython $BuildPython `
-    -TargetPythonRoot $runtimeRoot `
-    -RequirementsPath $RequirementsPath
 
   Write-BuildProgress -Status "Validating Python packages for $RuntimeName" -PercentComplete $ValidatePercent
   Test-PythonModules -PythonExe $pythonExe -RequiredModules $RequiredModules
