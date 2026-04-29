@@ -377,6 +377,7 @@ def resolve_whisperx_runtime() -> Tuple[str, str]:
     cuda_available = False
     device_count = 0
     device_name: Optional[str] = None
+    supported_compute_types: set[str] = set()
 
     try:
         cuda_available = bool(torch.cuda.is_available())
@@ -421,12 +422,41 @@ def resolve_whisperx_runtime() -> Tuple[str, str]:
         )
         raise RuntimeError(message) from exc
 
+    try:
+        import ctranslate2  # type: ignore
+
+        supported_compute_types = set(ctranslate2.get_supported_compute_types("cuda", 0))
+    except Exception as exc:
+        emit_diagnostic(
+            "preflight",
+            "WhisperX compute-type probe could not query CTranslate2 supported CUDA types. "
+            f"{type(exc).__name__}: {exc}",
+        )
+
+    compute_type = "float16"
+    if supported_compute_types:
+        preferred_compute_types = ["float16", "int8_float16", "int8", "float32", "int8_float32"]
+        compute_type = next((item for item in preferred_compute_types if item in supported_compute_types), "")
+        if not compute_type:
+            message = (
+                "WhisperX GPU preflight found a CUDA device, but CTranslate2 did not report a compatible "
+                "compute type for the selected runtime."
+            )
+            emit_diagnostic(
+                "preflight",
+                "WhisperX compute-type probe reported supported types="
+                f"{', '.join(sorted(supported_compute_types))}.",
+            )
+            raise RuntimeError(message)
+
     emit_diagnostic(
         "preflight",
         "WhisperX GPU preflight succeeded: "
-        f"cuda_devices={device_count}, device_name={device_name or 'unknown'}, compute_type=float16.",
+        f"cuda_devices={device_count}, device_name={device_name or 'unknown'}, "
+        f"compute_type={compute_type}, supported_compute_types="
+        f"{', '.join(sorted(supported_compute_types)) if supported_compute_types else 'unknown'}.",
     )
-    return "cuda", "float16"
+    return "cuda", compute_type
 
 
 def normalize_segments(
