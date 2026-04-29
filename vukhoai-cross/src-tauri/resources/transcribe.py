@@ -20,6 +20,10 @@ PROFILE_TO_MODEL = {
 EXPECTED_AUTO_LANGUAGES = {"uk"}
 UKRAINIAN_LANGUAGE = "uk"
 
+# Some Windows GPU backends can crash during native C++/CUDA teardown after
+# transcription has already succeeded. Keep models alive until process exit.
+_NATIVE_RUNTIME_KEEPALIVE: List[Any] = []
+
 
 @dataclass
 class Segment:
@@ -546,6 +550,7 @@ def transcribe_with_whisperx(
         compute_type=compute_type,
         vad_method="silero",
     )
+    _NATIVE_RUNTIME_KEEPALIVE.append(model)
     emit_diagnostic(
         "phase",
         f"WhisperX model loaded in {format_timestamp(time.perf_counter() - model_load_started)}.",
@@ -694,6 +699,7 @@ def transcribe_with_faster_whisper(
     emit_progress(10, "Loading model")
     model_load_started = time.perf_counter()
     model = WhisperModel(model_name, device=runtime.device, compute_type=runtime.compute_type)
+    _NATIVE_RUNTIME_KEEPALIVE.append(model)
     emit_diagnostic(
         "phase",
         f"faster-whisper model loaded in {format_timestamp(time.perf_counter() - model_load_started)}.",
@@ -954,4 +960,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    exit_code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if os.name == "nt":
+        os._exit(exit_code)
+    sys.exit(exit_code)
