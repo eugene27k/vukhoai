@@ -78,11 +78,17 @@ jobs:
           $zipPath = Join-Path $PWD "vukhoai-cross\portable-build\windows\Vukho.AI-Windows-Portable.zip"
           .\Scripts\package_windows_portable_zip.ps1 -SourceRoot $portableRoot -ZipPath $zipPath
 
+      - name: Split release assets for GitHub size limits
+        run: |
+          $zipPath = Join-Path $PWD "vukhoai-cross\portable-build\windows\Vukho.AI-Windows-Portable.zip"
+          $releaseAssets = Join-Path $PWD "vukhoai-cross\portable-build\windows\release-assets"
+          .\Scripts\split_windows_release_asset.ps1 -SourceZipPath $zipPath -OutputDirectory $releaseAssets
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: Vukho.AI-Windows-Portable
-          path: vukhoai-cross/portable-build/windows/Vukho.AI-Windows-Portable.zip
+          path: vukhoai-cross/portable-build/windows/release-assets/*
           if-no-files-found: error
 
       - name: Publish stable release ZIP
@@ -90,11 +96,11 @@ jobs:
         with:
           allowUpdates: true
           artifactErrorsFailBuild: true
-          artifacts: vukhoai-cross/portable-build/windows/Vukho.AI-Windows-Portable.zip
+          artifacts: vukhoai-cross/portable-build/windows/release-assets/*
           body: |
             Latest ready-to-run portable Windows build for Vukho.AI.
 
-            Download `Vukho.AI-Windows-Portable.zip`, extract it, and run the `.exe` inside.
+            The portable bootstrap script downloads and reassembles the release parts automatically.
           makeLatest: true
           name: Windows Portable Build (Latest)
           prerelease: false

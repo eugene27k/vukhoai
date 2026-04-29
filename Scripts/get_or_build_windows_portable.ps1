@@ -198,6 +198,73 @@ function Invoke-PortableDownload {
   }
 }
 
+function Join-PortableReleaseParts {
+  param(
+    [string]$ManifestPath,
+    [string]$DownloadRoot,
+    [string]$ZipPath,
+    [string]$Repository,
+    [string]$ReleaseTag
+  )
+
+  if (-not (Test-Path $ManifestPath)) {
+    throw "Missing release manifest: $ManifestPath"
+  }
+
+  $manifest = Get-Content $ManifestPath -Raw | ConvertFrom-Json
+  $parts = @($manifest.parts)
+  if ($parts.Count -eq 0) {
+    throw "Release manifest does not contain any parts."
+  }
+
+  if (Test-Path $ZipPath) {
+    Remove-Item $ZipPath -Force
+  }
+
+  $zipParent = Split-Path -Parent $ZipPath
+  if (-not [string]::IsNullOrWhiteSpace($zipParent)) {
+    New-Item -ItemType Directory -Force -Path $zipParent | Out-Null
+  }
+
+  $archiveName = if ($manifest.archive_name) { [string]$manifest.archive_name } else { [System.IO.Path]::GetFileName($ZipPath) }
+  $outputStream = [System.IO.File]::Open($ZipPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+
+  try {
+    $partIndex = 0
+    foreach ($part in $parts) {
+      $partIndex += 1
+      $partName = [string]$part.name
+      if ([string]::IsNullOrWhiteSpace($partName)) {
+        throw "Release manifest contains an empty part name."
+      }
+
+      $partPath = Join-Path $DownloadRoot $partName
+      $partUrl = "https://github.com/$Repository/releases/download/$ReleaseTag/$partName"
+      Write-PrepareProgress -Status "Downloading release part $partIndex of $($parts.Count)..." -PercentComplete (10 + [Math]::Min([int](($partIndex * 40.0) / [Math]::Max($parts.Count, 1)), 40))
+      Invoke-PortableDownload -Uri $partUrl -OutFile $partPath
+
+      $inputStream = [System.IO.File]::OpenRead($partPath)
+      try {
+        $inputStream.CopyTo($outputStream)
+      }
+      finally {
+        $inputStream.Dispose()
+      }
+    }
+  }
+  finally {
+    $outputStream.Dispose()
+  }
+
+  if ($manifest.archive_bytes) {
+    $expectedBytes = [Int64]$manifest.archive_bytes
+    $actualBytes = (Get-Item $ZipPath).Length
+    if ($expectedBytes -ne $actualBytes) {
+      throw "Reassembled archive size mismatch for $archiveName. Expected $expectedBytes bytes, got $actualBytes bytes."
+    }
+  }
+}
+
 function Resolve-PortableExe {
   param([string]$PortableRoot)
 
@@ -457,7 +524,10 @@ $downloadRoot = Join-Path $appRoot "portable-build\downloads"
 $windowsRoot = Join-Path $appRoot "portable-build\windows"
 $portableRoot = Join-Path $windowsRoot "Vukho.AI-Windows-Portable"
 $zipPath = Join-Path $downloadRoot $AssetName
+$manifestName = ([System.IO.Path]::GetFileNameWithoutExtension($AssetName)) + ".manifest.json"
+$manifestPath = Join-Path $downloadRoot $manifestName
 $releaseUrl = "https://github.com/$Repository/releases/download/$ReleaseTag/$AssetName"
+$manifestUrl = "https://github.com/$Repository/releases/download/$ReleaseTag/$manifestName"
 $localBuildScript = Join-Path $scriptRoot "build_windows_portable.ps1"
 
 if (-not (Test-Path $localBuildScript)) {
@@ -476,8 +546,27 @@ if (-not $ForceLocalBuild) {
       Remove-Item $zipPath -Force
     }
 
-    Write-PrepareProgress -Status "Downloading ready-made Windows build..." -PercentComplete 15
-    Invoke-PortableDownload -Uri $releaseUrl -OutFile $zipPath
+    if (Test-Path $manifestPath) {
+      Remove-Item $manifestPath -Force
+    }
+
+    try {
+      Write-PrepareProgress -Status "Downloading release manifest..." -PercentComplete 15
+      Invoke-PortableDownload -Uri $manifestUrl -OutFile $manifestPath
+      Join-PortableReleaseParts `
+        -ManifestPath $manifestPath `
+        -DownloadRoot $downloadRoot `
+        -ZipPath $zipPath `
+        -Repository $Repository `
+        -ReleaseTag $ReleaseTag
+    } catch {
+      if (Test-Path $manifestPath) {
+        Remove-Item $manifestPath -Force -ErrorAction SilentlyContinue
+      }
+
+      Write-PrepareProgress -Status "Downloading ready-made Windows build..." -PercentComplete 15
+      Invoke-PortableDownload -Uri $releaseUrl -OutFile $zipPath
+    }
 
     if (Test-Path $portableRoot) {
       Remove-Item $portableRoot -Recurse -Force
