@@ -306,6 +306,104 @@ if missing:
   }
 }
 
+function Test-PortableTorchCudaBuild {
+  param(
+    [string]$PythonExe,
+    [string]$Label
+  )
+
+  if (-not (Test-Path $PythonExe)) {
+    throw "$Label was not found: $PythonExe"
+  }
+
+  $script = @"
+import sys
+import torch
+
+cuda_version = getattr(torch.version, "cuda", None)
+cuda_built = False
+
+try:
+    cuda_built = bool(torch.backends.cuda.is_built())
+except Exception:
+    cuda_built = bool(cuda_version)
+
+if not cuda_built and not cuda_version:
+    print(
+        "Torch CUDA build is missing. "
+        f"torch.__version__={torch.__version__}, torch.version.cuda={cuda_version}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+print(
+    "Torch CUDA build validated: "
+    f"torch.__version__={torch.__version__}, torch.version.cuda={cuda_version}"
+)
+"@
+
+  $hadPythonHome = Test-Path Env:\PYTHONHOME
+  $hadPythonPath = Test-Path Env:\PYTHONPATH
+  $oldPythonHome = $env:PYTHONHOME
+  $oldPythonPath = $env:PYTHONPATH
+  $tempScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ("vukhoai-torch-check-" + [System.IO.Path]::GetRandomFileName() + ".py")
+  $stdoutPath = Join-Path ([System.IO.Path]::GetTempPath()) ("vukhoai-torch-check-" + [System.IO.Path]::GetRandomFileName() + ".out")
+  $stderrPath = Join-Path ([System.IO.Path]::GetTempPath()) ("vukhoai-torch-check-" + [System.IO.Path]::GetRandomFileName() + ".err")
+
+  try {
+    Remove-Item Env:\PYTHONHOME -ErrorAction SilentlyContinue
+    Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
+
+    Set-Content -Path $tempScriptPath -Value $script -Encoding ASCII
+    $process = Start-Process `
+      -FilePath $PythonExe `
+      -ArgumentList @($tempScriptPath) `
+      -NoNewWindow `
+      -Wait `
+      -PassThru `
+      -RedirectStandardOutput $stdoutPath `
+      -RedirectStandardError $stderrPath
+
+    $stdoutText = if (Test-Path $stdoutPath) { [System.IO.File]::ReadAllText($stdoutPath) } else { "" }
+    $stderrText = if (Test-Path $stderrPath) { [System.IO.File]::ReadAllText($stderrPath) } else { "" }
+
+    if (-not [string]::IsNullOrWhiteSpace($stdoutText)) {
+      Write-Host $stdoutText.TrimEnd()
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($stderrText)) {
+      Write-Host $stderrText.TrimEnd()
+    }
+
+    if ($process.ExitCode -ne 0) {
+      $detail = @($stdoutText, $stderrText) -join [Environment]::NewLine
+      $detail = $detail.Trim()
+      if ([string]::IsNullOrWhiteSpace($detail)) {
+        throw "$Label is present but PyTorch was built without CUDA support."
+      }
+
+      throw "$Label is present but PyTorch was built without CUDA support. $detail"
+    }
+  }
+  finally {
+    if ($hadPythonHome) {
+      $env:PYTHONHOME = $oldPythonHome
+    } else {
+      Remove-Item Env:\PYTHONHOME -ErrorAction SilentlyContinue
+    }
+
+    if ($hadPythonPath) {
+      $env:PYTHONPATH = $oldPythonPath
+    } else {
+      Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
+    }
+
+    Remove-Item $tempScriptPath -Force -ErrorAction SilentlyContinue
+    Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue
+    Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function Assert-PortablePackageReady {
   param([string]$PortableRoot)
 
@@ -339,6 +437,9 @@ function Assert-PortablePackageReady {
     Test-PortablePythonModules `
       -PythonExe $diarizationPython `
       -RequiredModules @("faster_whisper", "whisperx", "pyannote.audio") `
+      -Label "Embedded diarization runtime"
+    Test-PortableTorchCudaBuild `
+      -PythonExe $diarizationPython `
       -Label "Embedded diarization runtime"
   }
 

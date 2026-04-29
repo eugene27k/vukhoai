@@ -284,6 +284,11 @@ def resolve_faster_whisper_runtime(profile: str) -> FasterWhisperRuntime:
     try:
         import ctranslate2  # type: ignore
     except Exception as exc:
+        emit_diagnostic(
+            "preflight",
+            "faster-whisper GPU preflight failed because CTranslate2 could not be imported. "
+            f"{type(exc).__name__}: {exc}",
+        )
         return FasterWhisperRuntime(
             device="cpu",
             compute_type="int8",
@@ -302,6 +307,10 @@ def resolve_faster_whisper_runtime(profile: str) -> FasterWhisperRuntime:
         cuda_count = 0
 
     if cuda_count <= 0:
+        emit_diagnostic(
+            "preflight",
+            "faster-whisper GPU preflight did not detect a CUDA device in the selected runtime.",
+        )
         return FasterWhisperRuntime(
             device="cpu",
             compute_type="int8",
@@ -317,6 +326,13 @@ def resolve_faster_whisper_runtime(profile: str) -> FasterWhisperRuntime:
         supported_compute_types = set(ctranslate2.get_supported_compute_types("cuda", 0))
     except Exception:
         supported_compute_types = set()
+
+    emit_diagnostic(
+        "preflight",
+        "faster-whisper GPU preflight: "
+        f"cuda_devices={cuda_count}, supported_compute_types="
+        f"{', '.join(sorted(supported_compute_types)) if supported_compute_types else 'none'}.",
+    )
 
     if not supported_compute_types:
         return FasterWhisperRuntime(
@@ -353,6 +369,64 @@ def resolve_faster_whisper_runtime(profile: str) -> FasterWhisperRuntime:
         gpu_active=True,
         notice=f"Using NVIDIA CUDA acceleration for faster-whisper ({compute_type}).",
     )
+
+
+def resolve_whisperx_runtime() -> Tuple[str, str]:
+    import torch  # type: ignore
+
+    cuda_available = False
+    device_count = 0
+    device_name: Optional[str] = None
+
+    try:
+        cuda_available = bool(torch.cuda.is_available())
+    except Exception as exc:
+        message = (
+            "WhisperX GPU preflight failed while checking PyTorch CUDA availability. "
+            f"{type(exc).__name__}: {exc}"
+        )
+        emit_diagnostic("preflight", message)
+        raise RuntimeError(message) from exc
+
+    try:
+        device_count = int(torch.cuda.device_count())
+    except Exception:
+        device_count = 0
+
+    if not cuda_available or device_count <= 0:
+        message = (
+            "WhisperX GPU preflight failed: PyTorch CUDA is not available in the selected runtime, "
+            "so WhisperX is not allowed to fall back to CPU."
+        )
+        emit_diagnostic(
+            "preflight",
+            f"WhisperX GPU preflight: cuda_available={cuda_available}, cuda_devices={device_count}.",
+        )
+        raise RuntimeError(message)
+
+    try:
+        torch.cuda.init()
+        device_name = torch.cuda.get_device_name(0)
+        probe_tensor = torch.zeros(1, device="cuda:0")
+        _ = probe_tensor + 1
+        torch.cuda.synchronize(0)
+    except Exception as exc:
+        message = (
+            "WhisperX GPU preflight detected CUDA, but the selected runtime could not initialize "
+            f"the GPU successfully. {type(exc).__name__}: {exc}"
+        )
+        emit_diagnostic(
+            "preflight",
+            f"WhisperX GPU preflight failed after CUDA detection on device 0. {type(exc).__name__}: {exc}",
+        )
+        raise RuntimeError(message) from exc
+
+    emit_diagnostic(
+        "preflight",
+        "WhisperX GPU preflight succeeded: "
+        f"cuda_devices={device_count}, device_name={device_name or 'unknown'}, compute_type=float16.",
+    )
+    return "cuda", "float16"
 
 
 def normalize_segments(
@@ -424,23 +498,15 @@ def transcribe_with_whisperx(
     diarization_enabled: bool,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     import whisperx  # type: ignore
-    import torch  # type: ignore
 
     emit_progress(10, "Loading WhisperX model")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    compute_type = "float16" if device == "cuda" else "int8"
-    runtime_fallback_reason = None
-    if device != "cuda":
-        runtime_fallback_reason = (
-            "PyTorch CUDA is not available to the selected WhisperX runtime. "
-            "Transcription is running on CPU."
-        )
+    device, compute_type = resolve_whisperx_runtime()
     emit_runtime_state(
         engine="whisperx",
         device=device,
         compute_type=compute_type,
-        gpu_active=device == "cuda",
-        fallback_reason=runtime_fallback_reason,
+        gpu_active=True,
+        fallback_reason=None,
     )
 
     model_load_started = time.perf_counter()
@@ -561,8 +627,8 @@ def transcribe_with_whisperx(
         "engine": "whisperx",
         "runtime_device": device,
         "runtime_compute_type": compute_type,
-        "runtime_gpu_active": device == "cuda",
-        "runtime_fallback_reason": runtime_fallback_reason,
+        "runtime_gpu_active": True,
+        "runtime_fallback_reason": None,
         "detected_language": detected_language,
         "language_retry_reason": language_retry_reason,
         "alignment_applied": alignment_applied,
@@ -726,7 +792,7 @@ def main() -> int:
 
     whisperx_installed = importlib.util.find_spec("whisperx") is not None
 
-    if whisperx_installed:
+    if diarization_requested and whisperx_installed:
         try:
             raw_segments, engine_meta = transcribe_with_whisperx(
                 audio_path=args.input,
@@ -778,14 +844,20 @@ def main() -> int:
                     print(f"faster-whisper error: {fallback_error}", file=sys.stderr)
                     return 3
     else:
-        fallback_events.append("whisperx unavailable: module not installed")
-        upstream_fallback_reason = (
-            "WhisperX is not installed in the selected diarization Python. "
-            "Falling back to faster-whisper without diarization."
-        )
-        emit_notice(
-            "WhisperX is not installed in the selected diarization Python. Falling back to faster-whisper without diarization."
-        )
+        if diarization_requested:
+            fallback_events.append("whisperx unavailable: module not installed")
+            upstream_fallback_reason = (
+                "WhisperX is not installed in the selected diarization Python. "
+                "Falling back to faster-whisper without diarization."
+            )
+            emit_notice(
+                "WhisperX is not installed in the selected diarization Python. Falling back to faster-whisper without diarization."
+            )
+        else:
+            emit_diagnostic(
+                "preflight",
+                "Diarization is disabled for this job, so Vukho.AI is selecting faster-whisper as the primary runtime.",
+            )
         try:
             raw_segments, engine_meta = transcribe_with_faster_whisper(
                 audio_path=args.input,

@@ -1300,6 +1300,16 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
             }
         ),
     );
+    let _ = append_performance_log_to_job(
+        shared,
+        job_id,
+        "preflight",
+        if job.diarization_enabled {
+            "Diarization is enabled for this job. Vukho.AI will require WhisperX to pass a CUDA preflight before it is allowed to run; otherwise it will fall back to faster-whisper without diarization."
+        } else {
+            "Diarization is disabled for this job. Vukho.AI will run the faster-whisper path first and record a CUDA preflight before transcription starts."
+        },
+    );
 
     let mut command = Command::new(&python_binary);
     configure_python_command(&mut command, &python_binary);

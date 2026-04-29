@@ -386,6 +386,40 @@ function Install-TargetRequirements {
   )
 }
 
+function Install-TargetPackages {
+  param(
+    [string]$BuildPython,
+    [string]$TargetPythonRoot,
+    [string[]]$Packages,
+    [string]$IndexUrl = ""
+  )
+
+  if ($null -eq $Packages -or $Packages.Count -eq 0) {
+    return
+  }
+
+  $sitePackages = Join-Path $TargetPythonRoot "Lib\site-packages"
+  New-Item -ItemType Directory -Force -Path $sitePackages | Out-Null
+
+  $arguments = @(
+    "-m",
+    "pip",
+    "install",
+    "--upgrade",
+    "--prefer-binary",
+    "--no-warn-script-location",
+    "--target",
+    $sitePackages
+  )
+
+  if (-not [string]::IsNullOrWhiteSpace($IndexUrl)) {
+    $arguments += @("--index-url", $IndexUrl)
+  }
+
+  $arguments += $Packages
+  Invoke-NativeCommand -FilePath $BuildPython -ArgumentList $arguments
+}
+
 function Test-PythonModules {
   param(
     [string]$PythonExe,
@@ -481,6 +515,98 @@ print("Validated modules: " + ", ".join(modules))
   }
 }
 
+function Test-TorchCudaBuild {
+  param(
+    [string]$PythonExe,
+    [string]$Label
+  )
+
+  $hadPythonHome = Test-Path Env:\PYTHONHOME
+  $hadPythonPath = Test-Path Env:\PYTHONPATH
+  $oldPythonHome = $env:PYTHONHOME
+  $oldPythonPath = $env:PYTHONPATH
+  $tempScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ("vukhoai-torch-check-" + [System.IO.Path]::GetRandomFileName() + ".py")
+  $stdoutPath = Join-Path ([System.IO.Path]::GetTempPath()) ("vukhoai-torch-check-" + [System.IO.Path]::GetRandomFileName() + ".out")
+  $stderrPath = Join-Path ([System.IO.Path]::GetTempPath()) ("vukhoai-torch-check-" + [System.IO.Path]::GetRandomFileName() + ".err")
+  $script = @"
+import sys
+import torch
+
+cuda_version = getattr(torch.version, "cuda", None)
+cuda_built = False
+
+try:
+    cuda_built = bool(torch.backends.cuda.is_built())
+except Exception:
+    cuda_built = bool(cuda_version)
+
+if not cuda_built and not cuda_version:
+    print(
+        "Torch CUDA build is missing. "
+        f"torch.__version__={torch.__version__}, torch.version.cuda={cuda_version}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+print(
+    "Torch CUDA build validated: "
+    f"torch.__version__={torch.__version__}, torch.version.cuda={cuda_version}"
+)
+"@
+
+  try {
+    Remove-Item Env:\PYTHONHOME -ErrorAction SilentlyContinue
+    Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
+    Set-Content -Path $tempScriptPath -Value $script -Encoding ASCII
+    $process = Start-Process `
+      -FilePath $PythonExe `
+      -ArgumentList @($tempScriptPath) `
+      -NoNewWindow `
+      -Wait `
+      -PassThru `
+      -RedirectStandardOutput $stdoutPath `
+      -RedirectStandardError $stderrPath
+
+    $stdoutText = if (Test-Path $stdoutPath) { [System.IO.File]::ReadAllText($stdoutPath) } else { "" }
+    $stderrText = if (Test-Path $stderrPath) { [System.IO.File]::ReadAllText($stderrPath) } else { "" }
+
+    if (-not [string]::IsNullOrWhiteSpace($stdoutText)) {
+      Write-Host $stdoutText.TrimEnd()
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($stderrText)) {
+      Write-Host $stderrText.TrimEnd()
+    }
+
+    if ($process.ExitCode -ne 0) {
+      $detail = @($stdoutText, $stderrText) -join [Environment]::NewLine
+      $detail = $detail.Trim()
+      if ([string]::IsNullOrWhiteSpace($detail)) {
+        throw "$Label is present but PyTorch was built without CUDA support."
+      }
+
+      throw "$Label is present but PyTorch was built without CUDA support. $detail"
+    }
+  }
+  finally {
+    if ($hadPythonHome) {
+      $env:PYTHONHOME = $oldPythonHome
+    } else {
+      Remove-Item Env:\PYTHONHOME -ErrorAction SilentlyContinue
+    }
+
+    if ($hadPythonPath) {
+      $env:PYTHONPATH = $oldPythonPath
+    } else {
+      Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue
+    }
+
+    Remove-Item $tempScriptPath -Force -ErrorAction SilentlyContinue
+    Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue
+    Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function New-PortablePythonRuntime {
   param(
     [string]$RuntimeName,
@@ -490,6 +616,9 @@ function New-PortablePythonRuntime {
     [string]$PortableRoot,
     [string]$RequirementsPath,
     [string[]]$RequiredModules,
+    [string[]]$PreInstallPackages = @(),
+    [string]$PreInstallIndexUrl = "",
+    [switch]$RequireCudaTorchBuild,
     [int]$PreparePercent,
     [int]$InstallPercent,
     [int]$ValidatePercent
@@ -502,6 +631,15 @@ function New-PortablePythonRuntime {
     -Destination $runtimeRoot `
     -DownloadRoot $DownloadRoot
 
+  if ($PreInstallPackages.Count -gt 0) {
+    Write-Step "Installing pinned runtime packages for $RuntimeName"
+    Install-TargetPackages `
+      -BuildPython $BuildPython `
+      -TargetPythonRoot $runtimeRoot `
+      -Packages $PreInstallPackages `
+      -IndexUrl $PreInstallIndexUrl
+  }
+
   Write-BuildProgress -Status "Installing Python packages for $RuntimeName" -PercentComplete $InstallPercent
   Install-TargetRequirements `
     -BuildPython $BuildPython `
@@ -510,6 +648,9 @@ function New-PortablePythonRuntime {
 
   Write-BuildProgress -Status "Validating Python packages for $RuntimeName" -PercentComplete $ValidatePercent
   Test-PythonModules -PythonExe $pythonExe -RequiredModules $RequiredModules
+  if ($RequireCudaTorchBuild) {
+    Test-TorchCudaBuild -PythonExe $pythonExe -Label $RuntimeName
+  }
   return $pythonExe
 }
 
@@ -550,6 +691,16 @@ $seedPath = Join-Path $portableBuildRoot "portable-state.local.json"
 $resourceRoot = Join-Path $portableRoot "resources"
 $mainRequirements = Join-Path $repoRoot "Scripts\requirements.txt"
 $diarizationRequirements = Join-Path $repoRoot "Scripts\requirements-diarization.txt"
+$diarizationTorchIndexUrl = if ($env:VUKHOAI_DIARIZATION_TORCH_INDEX_URL) {
+  $env:VUKHOAI_DIARIZATION_TORCH_INDEX_URL
+} else {
+  "https://download.pytorch.org/whl/cu126"
+}
+$diarizationTorchPackages = @(
+  "torch==2.8.0",
+  "torchvision==0.23.0",
+  "torchaudio==2.8.0"
+)
 $portablePythonMajorMinor = (($PortablePythonVersion -split "\.") | Select-Object -First 2) -join "."
 $buildVenvPath = Join-Path $portableBuildRoot "python-build-$portablePythonMajorMinor"
 
@@ -634,6 +785,9 @@ if (-not $SkipDiarizationRuntime) {
     -PortableRoot $portableRoot `
     -RequirementsPath $diarizationRequirements `
     -RequiredModules @("faster_whisper", "whisperx", "pyannote.audio") `
+    -PreInstallPackages $diarizationTorchPackages `
+    -PreInstallIndexUrl $diarizationTorchIndexUrl `
+    -RequireCudaTorchBuild `
     -PreparePercent 88 `
     -InstallPercent 92 `
     -ValidatePercent 96
