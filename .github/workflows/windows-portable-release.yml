@@ -76,12 +76,7 @@ jobs:
         run: |
           $portableRoot = Join-Path $PWD "vukhoai-cross\portable-build\windows\Vukho.AI-Windows-Portable"
           $zipPath = Join-Path $PWD "vukhoai-cross\portable-build\windows\Vukho.AI-Windows-Portable.zip"
-
-          if (Test-Path $zipPath) {
-            Remove-Item $zipPath -Force
-          }
-
-          Compress-Archive -Path $portableRoot -DestinationPath $zipPath -Force
+          .\Scripts\package_windows_portable_zip.ps1 -SourceRoot $portableRoot -ZipPath $zipPath
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
