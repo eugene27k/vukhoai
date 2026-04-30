@@ -832,9 +832,9 @@ def transcribe_with_faster_whisper(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Vukho.AI local transcription pipeline")
-    parser.add_argument("--input", required=True, help="Path to input audio file")
-    parser.add_argument("--output", required=True, help="Path to output TXT file")
-    parser.add_argument("--meta", required=True, help="Path to metadata JSON file")
+    parser.add_argument("--input", help="Path to input audio file")
+    parser.add_argument("--output", help="Path to output TXT file")
+    parser.add_argument("--meta", help="Path to metadata JSON file")
     parser.add_argument("--profile", choices=["max", "balanced", "fast"], default="max")
     parser.add_argument("--language", choices=["auto", "uk"], default="auto")
     parser.add_argument("--diarization", choices=["on", "off"], default="on")
@@ -846,10 +846,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    if not os.path.exists(args.input):
-        print(f"Input file not found: {args.input}", file=sys.stderr)
-        return 2
-
     model_name = PROFILE_TO_MODEL[args.profile]
     diarization_requested = args.diarization == "on"
     total_duration_seconds = args.duration_seconds if args.duration_seconds > 0 else None
@@ -859,6 +855,19 @@ def main() -> int:
             print("Diarization is mandatory for Vukho.AI jobs. Refusing transcription-only preflight.", file=sys.stderr)
             return 2
         return run_mandatory_preflight()
+
+    missing_args = [
+        flag
+        for flag, value in (("--input", args.input), ("--output", args.output), ("--meta", args.meta))
+        if not value
+    ]
+    if missing_args:
+        print(f"Missing required arguments for processing: {', '.join(missing_args)}", file=sys.stderr)
+        return 2
+
+    if not os.path.exists(args.input):
+        print(f"Input file not found: {args.input}", file=sys.stderr)
+        return 2
 
     output_dir = os.path.dirname(args.output)
     meta_dir = os.path.dirname(args.meta)

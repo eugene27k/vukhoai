@@ -127,6 +127,54 @@ function Write-PortableReleaseFingerprint {
   Set-Content -Path $markerPath -Value $Fingerprint -Encoding ASCII
 }
 
+function Stop-PortableAppProcesses {
+  param([string]$PortableRoot)
+
+  $exePath = Join-Path $PortableRoot "vukhoai-cross.exe"
+  if (-not (Test-Path $exePath)) {
+    return
+  }
+
+  $exeFullPath = [System.IO.Path]::GetFullPath($exePath)
+  $processName = [System.IO.Path]::GetFileNameWithoutExtension($exePath)
+  $processes = @(
+    Get-Process -Name $processName -ErrorAction SilentlyContinue |
+      Where-Object {
+        try {
+          $_.Path -and ([System.IO.Path]::GetFullPath($_.Path) -ieq $exeFullPath)
+        } catch {
+          $false
+        }
+      }
+  )
+
+  if ($processes.Count -eq 0) {
+    return
+  }
+
+  Write-Host "Closing running Vukho.AI before refreshing portable files..."
+  foreach ($process in $processes) {
+    try {
+      if ($process.MainWindowHandle -ne 0) {
+        [void]$process.CloseMainWindow()
+      }
+    } catch {
+      # If the process does not expose a window, fall through to Stop-Process.
+    }
+  }
+
+  Start-Sleep -Seconds 2
+  foreach ($process in $processes) {
+    try {
+      if (-not $process.HasExited) {
+        Stop-Process -Id $process.Id -Force
+      }
+    } catch {
+      # The process may have already exited after CloseMainWindow.
+    }
+  }
+}
+
 function Update-DownloadProgress {
   param(
     [string]$Activity,
@@ -760,6 +808,7 @@ if (-not $ForceLocalBuild) {
     if (Test-Path $portableRoot) {
       if ($manifestDownloaded -and -not (Test-PortableReleaseFingerprint -PortableRoot $portableRoot -ExpectedFingerprint $releaseFingerprint)) {
         Write-Host "Cached Windows app is from a different release; refreshing extracted files."
+        Stop-PortableAppProcesses -PortableRoot $portableRoot
         Remove-Item $portableRoot -Recurse -Force
       } else {
         try {
@@ -779,6 +828,7 @@ if (-not $ForceLocalBuild) {
           exit 0
         } catch {
           Write-Host "Cached Windows app is not valid yet; refreshing extracted files."
+          Stop-PortableAppProcesses -PortableRoot $portableRoot
           Remove-Item $portableRoot -Recurse -Force
         }
       }
