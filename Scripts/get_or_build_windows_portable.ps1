@@ -64,6 +64,69 @@ function Format-Duration {
   return $Duration.ToString("mm\:ss")
 }
 
+function Get-FileSha256 {
+  param([string]$Path)
+
+  if (-not (Test-Path $Path)) {
+    return $null
+  }
+
+  return (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLowerInvariant()
+}
+
+function Test-ExpectedSha256 {
+  param(
+    [string]$Path,
+    [string]$ExpectedSha256
+  )
+
+  if ([string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+    return $false
+  }
+
+  $actualSha256 = Get-FileSha256 -Path $Path
+  return $actualSha256 -eq $ExpectedSha256.Trim().ToLowerInvariant()
+}
+
+function Get-ManifestFingerprint {
+  param([string]$ManifestPath)
+
+  return Get-FileSha256 -Path $ManifestPath
+}
+
+function Test-PortableReleaseFingerprint {
+  param(
+    [string]$PortableRoot,
+    [string]$ExpectedFingerprint
+  )
+
+  if ([string]::IsNullOrWhiteSpace($ExpectedFingerprint)) {
+    return $false
+  }
+
+  $markerPath = Join-Path $PortableRoot ".vukhoai-release-fingerprint"
+  if (-not (Test-Path $markerPath)) {
+    return $false
+  }
+
+  $actualFingerprint = (Get-Content -Path $markerPath -Raw).Trim()
+  return $actualFingerprint -eq $ExpectedFingerprint
+}
+
+function Write-PortableReleaseFingerprint {
+  param(
+    [string]$PortableRoot,
+    [string]$Fingerprint
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Fingerprint)) {
+    return
+  }
+
+  $markerPath = Join-Path $PortableRoot ".vukhoai-release-fingerprint"
+  Set-Content -Path $markerPath -Value $Fingerprint -Encoding ASCII
+}
+
 function Update-DownloadProgress {
   param(
     [string]$Activity,
@@ -263,7 +326,8 @@ function Join-PortableReleaseParts {
   if ($manifest.archive_bytes -and (Test-Path $ZipPath)) {
     $expectedArchiveBytes = [Int64]$manifest.archive_bytes
     $actualArchiveBytes = (Get-Item $ZipPath).Length
-    if ($expectedArchiveBytes -eq $actualArchiveBytes) {
+    $expectedArchiveSha256 = if ($manifest.archive_sha256) { [string]$manifest.archive_sha256 } else { "" }
+    if ($expectedArchiveBytes -eq $actualArchiveBytes -and (Test-ExpectedSha256 -Path $ZipPath -ExpectedSha256 $expectedArchiveSha256)) {
       Write-Host "Using cached release archive: $([System.IO.Path]::GetFileName($ZipPath))"
       return
     }
@@ -297,7 +361,8 @@ function Join-PortableReleaseParts {
       if ((Test-Path $partPath) -and $part.bytes) {
         $expectedPartBytes = [Int64]$part.bytes
         $actualPartBytes = (Get-Item $partPath).Length
-        if ($expectedPartBytes -eq $actualPartBytes) {
+        $expectedPartSha256 = if ($part.sha256) { [string]$part.sha256 } else { "" }
+        if ($expectedPartBytes -eq $actualPartBytes -and (Test-ExpectedSha256 -Path $partPath -ExpectedSha256 $expectedPartSha256)) {
           Write-Host "Using cached release part $partIndex of $($parts.Count): $partName"
           $partReady = $true
         } else {
@@ -316,6 +381,10 @@ function Join-PortableReleaseParts {
         if ($expectedPartBytes -ne $actualPartBytes) {
           throw "Release part size mismatch for $partName. Expected $expectedPartBytes bytes, got $actualPartBytes bytes."
         }
+      }
+
+      if ($part.sha256 -and -not (Test-ExpectedSha256 -Path $partPath -ExpectedSha256 ([string]$part.sha256))) {
+        throw "Release part checksum mismatch for $partName."
       }
 
       $inputStream = [System.IO.File]::OpenRead($partPath)
@@ -337,6 +406,10 @@ function Join-PortableReleaseParts {
     if ($expectedBytes -ne $actualBytes) {
       throw "Reassembled archive size mismatch for $archiveName. Expected $expectedBytes bytes, got $actualBytes bytes."
     }
+  }
+
+  if ($manifest.archive_sha256 -and -not (Test-ExpectedSha256 -Path $ZipPath -ExpectedSha256 ([string]$manifest.archive_sha256))) {
+    throw "Reassembled archive checksum mismatch for $archiveName."
   }
 }
 
@@ -585,6 +658,15 @@ function Assert-PortablePackageReady {
     throw "The package is missing resources\transcribe.py."
   }
 
+  $transcribeSource = Get-Content -Path $transcribeScript -Raw
+  if ($transcribeSource -notmatch "--preflight-only") {
+    throw "The package is outdated and does not support mandatory runtime preflight."
+  }
+
+  if ($transcribeSource -match "Diarization is disabled for this job") {
+    throw "The package is outdated and can still disable mandatory diarization."
+  }
+
   $embeddedPython = Join-Path $PortableRoot "python\python.exe"
   if (-not (Test-Path $embeddedPython)) {
     $legacyVenv = Join-Path $PortableRoot ".venv\Scripts\python.exe"
@@ -643,6 +725,8 @@ if (-not $ForceLocalBuild) {
     New-Item -ItemType Directory -Force -Path $downloadRoot | Out-Null
     New-Item -ItemType Directory -Force -Path $windowsRoot | Out-Null
 
+    $releaseFingerprint = $null
+
     if (Test-Path $manifestPath) {
       Remove-Item $manifestPath -Force
     }
@@ -658,6 +742,7 @@ if (-not $ForceLocalBuild) {
         -ZipPath $zipPath `
         -Repository $Repository `
         -ReleaseTag $ReleaseTag
+      $releaseFingerprint = Get-ManifestFingerprint -ManifestPath $manifestPath
     } catch {
       if ($manifestDownloaded) {
         throw
@@ -669,27 +754,33 @@ if (-not $ForceLocalBuild) {
 
       Write-PrepareProgress -Status "Downloading ready-made Windows build..." -PercentComplete 15
       Invoke-PortableDownload -Uri $releaseUrl -OutFile $zipPath
+      $releaseFingerprint = $null
     }
 
     if (Test-Path $portableRoot) {
-      try {
-        Write-PrepareProgress -Status "Validating cached Windows app..." -PercentComplete 75
-        $portableExe = Assert-PortablePackageReady -PortableRoot $portableRoot
-
-        Write-PrepareProgress -Status "Windows portable app is ready." -PercentComplete 100
-        Write-Host "Ready-to-run Windows app is already available."
-        Write-Host "Path: $portableRoot"
-
-        if ($OpenFolder) {
-          Invoke-Item $portableRoot
-        } else {
-          Invoke-Item $portableExe.FullName
-        }
-
-        exit 0
-      } catch {
-        Write-Host "Cached Windows app is not valid yet; refreshing extracted files."
+      if ($manifestDownloaded -and -not (Test-PortableReleaseFingerprint -PortableRoot $portableRoot -ExpectedFingerprint $releaseFingerprint)) {
+        Write-Host "Cached Windows app is from a different release; refreshing extracted files."
         Remove-Item $portableRoot -Recurse -Force
+      } else {
+        try {
+          Write-PrepareProgress -Status "Validating cached Windows app..." -PercentComplete 75
+          $portableExe = Assert-PortablePackageReady -PortableRoot $portableRoot
+
+          Write-PrepareProgress -Status "Windows portable app is ready." -PercentComplete 100
+          Write-Host "Ready-to-run Windows app is already available."
+          Write-Host "Path: $portableRoot"
+
+          if ($OpenFolder) {
+            Invoke-Item $portableRoot
+          } else {
+            Invoke-Item $portableExe.FullName
+          }
+
+          exit 0
+        } catch {
+          Write-Host "Cached Windows app is not valid yet; refreshing extracted files."
+          Remove-Item $portableRoot -Recurse -Force
+        }
       }
     }
 
@@ -699,6 +790,7 @@ if (-not $ForceLocalBuild) {
 
     Write-PrepareProgress -Status "Validating extracted Windows app..." -PercentComplete 92
     $portableExe = Assert-PortablePackageReady -PortableRoot $portableRoot
+    Write-PortableReleaseFingerprint -PortableRoot $portableRoot -Fingerprint $releaseFingerprint
 
     Write-PrepareProgress -Status "Windows portable app is ready." -PercentComplete 100
     Write-Host "Ready-to-run Windows app downloaded successfully."

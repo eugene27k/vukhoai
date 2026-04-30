@@ -10,6 +10,12 @@ Param(
 
 $ErrorActionPreference = "Stop"
 
+function Get-FileSha256 {
+  param([string]$Path)
+
+  return (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLowerInvariant()
+}
+
 $sourceFile = Get-Item (Resolve-Path $SourceZipPath)
 if ($sourceFile.Length -le 0) {
   throw "Source ZIP is empty: $($sourceFile.FullName)"
@@ -60,6 +66,7 @@ try {
     $parts.Add([ordered]@{
       name = $partInfo.Name
       bytes = $partInfo.Length
+      sha256 = Get-FileSha256 -Path $partInfo.FullName
     }) | Out-Null
   }
 }
@@ -68,10 +75,12 @@ finally {
 }
 
 $manifest = [ordered]@{
-  format_version = 1
+  format_version = 2
   archive_name = $archiveName
   archive_bytes = $sourceFile.Length
+  archive_sha256 = Get-FileSha256 -Path $sourceFile.FullName
   part_size_bytes = $PartSizeBytes
+  created_at_utc = (Get-Date).ToUniversalTime().ToString("o")
   parts = $parts
 }
 
