@@ -1295,12 +1295,12 @@ fn run_mandatory_runtime_preflight(
         return Err(combined);
     }
 
-    append_performance_log_to_job(
+    let _ = append_performance_log_to_job(
         shared,
         job_id,
         "preflight",
         "Mandatory runtime preflight passed before audio processing.",
-    )?;
+    );
     Ok(())
 }
 
