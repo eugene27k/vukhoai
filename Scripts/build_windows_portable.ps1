@@ -8,6 +8,10 @@ Param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($SkipDiarizationRuntime) {
+  throw "Diarization runtime is mandatory for Windows portable builds. Remove -SkipDiarizationRuntime."
+}
 $buildProgressActivity = "Building Windows portable app"
 
 function Test-IsWindowsHost {

@@ -679,7 +679,7 @@ function App() {
           <img className="brand-logo" src={earLogo} alt="Vukho.AI ear logo" />
           <div>
             <h1>Vukho.AI</h1>
-            <p>Offline transcription (.m4a/.mp4) for macOS and Windows.</p>
+            <p>Offline transcription with speaker diarization (.m4a/.mp4) for macOS and Windows.</p>
           </div>
         </div>
         <div className="topbar-actions">
@@ -704,7 +704,7 @@ function App() {
           />
           <button onClick={pickInputFile}>Import File...</button>
           <button className="primary" onClick={enqueueSelected}>
-            Transcribe
+            Transcribe & diarize
           </button>
         </div>
         {dragActive && <div className="import-drop-overlay">Drop files to queue transcription</div>}
@@ -793,7 +793,7 @@ function App() {
                   {fallbackReason && (
                     <div className="fallback-panel">
                       <div className="fallback-header">
-                        <span>Fallback reason</span>
+                        <span>Runtime issue</span>
                         <button type="button" className="fallback-copy" onClick={() => void copyFallbackReason(job)}>
                           Copy reason
                         </button>
@@ -995,19 +995,10 @@ function App() {
                 </select>
               </label>
 
-              <label className="checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={settingsDraft.diarization_enabled}
-                  onChange={(e) =>
-                    setSettingsDraft({
-                      ...settingsDraft,
-                      diarization_enabled: e.target.checked,
-                    })
-                  }
-                />
-                Enable diarization
-              </label>
+              <div className="checkbox-row">
+                <input type="checkbox" checked readOnly />
+                Speaker diarization required
+              </div>
 
               <label>
                 Output folder
@@ -1102,8 +1093,8 @@ function App() {
 
             <div className="settings-note">
               Most users should leave both Python fields empty. The app will prefer the bundled
-              runtime when available and otherwise auto-detect a working Python environment. Only
-              set a diarization Python path if you intentionally manage a separate advanced runtime.
+              diarization runtime and stop before processing if WhisperX, pyannote, and CUDA are
+              not ready.
             </div>
 
             {settingsStatus && <div className="banner ok">{settingsStatus}</div>}
@@ -1338,12 +1329,12 @@ function buildFallbackReason(job: ImportJob): string | null {
     blocks.push(
       runtimeContext
         ? `Transcription runtime: ${runtimeContext}\nReason: ${runtimeReason}`
-        : `Transcription runtime fallback:\n${runtimeReason}`,
+        : `Transcription runtime issue:\n${runtimeReason}`,
     );
   }
 
   if (diarizationReason) {
-    blocks.push(`Diarization fallback:\n${diarizationReason}`);
+    blocks.push(`Diarization issue:\n${diarizationReason}`);
   }
 
   const uniqueBlocks = [...new Set(blocks)];

@@ -16,7 +16,7 @@ use uuid::Uuid;
 const JOBS_EVENT: &str = "vukhoai://jobs-updated";
 const SETTINGS_EVENT: &str = "vukhoai://settings-updated";
 const PORTABLE_STATE_FILE_NAME: &str = "portable-state.json";
-const STATE_SCHEMA_VERSION: u32 = 3;
+const STATE_SCHEMA_VERSION: u32 = 4;
 const MAX_PERFORMANCE_LOG_ENTRIES: usize = 80;
 const PERFORMANCE_GAP_WARNING_SECONDS: i64 = 15 * 60;
 const PERFORMANCE_PROGRESS_MILESTONE_STEP: f64 = 25.0;
@@ -161,7 +161,7 @@ impl AppSettings {
         Self {
             default_profile: TranscriptionProfile::MaximumQuality,
             language_mode: LanguageMode::Ukrainian,
-            diarization_enabled: false,
+            diarization_enabled: true,
             output_folder_path: default_output_directory().to_string_lossy().into_owned(),
             python_path: None,
             diarization_python_path: None,
@@ -277,6 +277,9 @@ struct PythonRuntimeCapabilities {
     has_faster_whisper: bool,
     has_whisperx: bool,
     has_pyannote_audio: bool,
+    torch_cuda_available: bool,
+    torch_cuda_device_count: u32,
+    ctranslate2_cuda_device_count: u32,
 }
 
 impl PythonRuntimeCapabilities {
@@ -285,7 +288,11 @@ impl PythonRuntimeCapabilities {
     }
 
     fn supports_diarization(self) -> bool {
-        self.has_whisperx && self.has_pyannote_audio
+        self.has_whisperx
+            && self.has_pyannote_audio
+            && self.torch_cuda_available
+            && self.torch_cuda_device_count > 0
+            && self.ctranslate2_cuda_device_count > 0
     }
 }
 
@@ -297,6 +304,12 @@ struct PythonRuntimeCapabilitiesJson {
     whisperx: bool,
     #[serde(default)]
     pyannote_audio: bool,
+    #[serde(default)]
+    torch_cuda_available: bool,
+    #[serde(default)]
+    torch_cuda_device_count: u32,
+    #[serde(default)]
+    ctranslate2_cuda_device_count: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -441,7 +454,7 @@ fn update_settings(
     guard.persisted.settings = AppSettings {
         default_profile: payload.default_profile,
         language_mode: payload.language_mode,
-        diarization_enabled: payload.diarization_enabled,
+        diarization_enabled: true,
         output_folder_path: output_path.to_string_lossy().into_owned(),
         python_path: payload
             .python_path
@@ -516,7 +529,7 @@ fn enqueue_job(state: State<'_, AppShared>, input_path: String) -> Result<Import
         duration_seconds: None,
         profile: settings.default_profile,
         language_mode: settings.language_mode,
-        diarization_enabled: settings.diarization_enabled,
+        diarization_enabled: true,
         output_txt_path: None,
         meta_json_path: None,
         error_message: None,
@@ -566,6 +579,7 @@ fn retry_job(state: State<'_, AppShared>, job_id: String) -> Result<(), String> 
     };
 
     job.status = JobStatus::Queued;
+    job.diarization_enabled = true;
     job.error_message = None;
     job.notice_message = None;
     job.runtime_engine = None;
@@ -966,6 +980,7 @@ fn worker_loop(shared: AppShared) {
 
             if let Some(job) = guard.persisted.jobs.iter_mut().find(|j| j.id == *job_id) {
                 job.status = JobStatus::Processing;
+                job.diarization_enabled = true;
                 job.error_message = None;
                 job.notice_message = None;
                 job.runtime_engine = None;
@@ -979,7 +994,7 @@ fn worker_loop(shared: AppShared) {
                 job.wall_elapsed_seconds = None;
                 job.audio_to_wall_ratio = None;
                 job.progress_percent = Some(1.0);
-                job.progress_stage = Some("Preparing audio".to_string());
+                job.progress_stage = Some("Checking mandatory runtime".to_string());
                 job.progress_eta_seconds = None;
                 job.processing_started_at = Some(Utc::now());
                 job.is_paused = false;
@@ -1215,9 +1230,83 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
     emit_full_state(&shared.core);
 }
 
+fn run_mandatory_runtime_preflight(
+    shared: &AppShared,
+    job_id: &str,
+    settings: &AppSettings,
+    job: &ImportJob,
+    python_binary: &str,
+    output_path: &str,
+    meta_path: &str,
+) -> Result<(), String> {
+    let mut command = Command::new(python_binary);
+    configure_python_command(&mut command, python_binary);
+    command
+        .arg(&shared.core.script_path)
+        .arg("--input")
+        .arg(&job.input_path)
+        .arg("--output")
+        .arg(output_path)
+        .arg("--meta")
+        .arg(meta_path)
+        .arg("--profile")
+        .arg(job.profile.python_flag())
+        .arg("--language")
+        .arg(job.language_mode.python_flag())
+        .arg("--diarization")
+        .arg("on")
+        .arg("--duration-seconds")
+        .arg("0")
+        .arg("--preflight-only");
+
+    if let Some(token) = settings
+        .huggingface_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        command.env("HF_TOKEN", token);
+        command.env("HUGGINGFACE_HUB_TOKEN", token);
+    }
+
+    let output = command
+        .output()
+        .map_err(|e| format!("Unable to start mandatory runtime preflight: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut stdout_non_progress: Vec<String> = Vec::new();
+    for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if !apply_runtime_line(shared, job_id, line) {
+            stdout_non_progress.push(line.to_string());
+        }
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        let combined = format!("{}\n{}", stdout_non_progress.join("\n"), stderr)
+            .trim()
+            .to_string();
+        if combined.is_empty() {
+            return Err(format!(
+                "Mandatory runtime preflight failed with exit code {}.",
+                output.status.code().unwrap_or(-1)
+            ));
+        }
+
+        return Err(combined);
+    }
+
+    append_performance_log_to_job(
+        shared,
+        job_id,
+        "preflight",
+        "Mandatory runtime preflight passed before audio processing.",
+    )?;
+    Ok(())
+}
+
 fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
     let run_started = Instant::now();
-    let (settings, job) = {
+    let (settings, mut job) = {
         let guard = shared
             .core
             .worker
@@ -1228,11 +1317,48 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
         };
         (guard.persisted.settings.clone(), job.clone())
     };
+    job.diarization_enabled = true;
 
     fs::create_dir_all(&shared.core.normalized_dir)
         .map_err(|e| format!("Unable to prepare audio cache directory: {e}"))?;
     fs::create_dir_all(&shared.core.metadata_dir)
         .map_err(|e| format!("Unable to prepare metadata directory: {e}"))?;
+
+    let output_path = output_txt_path(&settings, &job);
+    let meta_path = shared
+        .core
+        .metadata_dir
+        .join(format!("{}.json", job.id))
+        .to_string_lossy()
+        .into_owned();
+
+    if let Some(parent) = Path::new(&output_path).parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Unable to prepare output directory: {e}"))?;
+    }
+
+    let python_binary = resolve_python_binary(&settings, &shared.core.script_path, true)?;
+    let _ = append_performance_log_to_job(
+        shared,
+        job_id,
+        "runtime",
+        format!("Selected Python runtime: {python_binary} (mandatory diarization)"),
+    );
+    let _ = append_performance_log_to_job(
+        shared,
+        job_id,
+        "preflight",
+        "Diarization is mandatory. Vukho.AI will require WhisperX, pyannote, and CUDA preflight to pass before audio processing continues.",
+    );
+    run_mandatory_runtime_preflight(
+        shared,
+        job_id,
+        &settings,
+        &job,
+        &python_binary,
+        &output_path,
+        &meta_path,
+    )?;
 
     let _ = append_performance_log_to_job(
         shared,
@@ -1271,46 +1397,6 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
     let _ = persist_state(&shared.core);
     emit_full_state(&shared.core);
 
-    let output_path = output_txt_path(&settings, &job);
-    let meta_path = shared
-        .core
-        .metadata_dir
-        .join(format!("{}.json", job.id))
-        .to_string_lossy()
-        .into_owned();
-
-    if let Some(parent) = Path::new(&output_path).parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Unable to prepare output directory: {e}"))?;
-    }
-
-    let python_binary =
-        resolve_python_binary(&settings, &shared.core.script_path, job.diarization_enabled)?;
-    let _ = append_performance_log_to_job(
-        shared,
-        job_id,
-        "runtime",
-        format!(
-            "Selected Python runtime: {}{}",
-            python_binary,
-            if job.diarization_enabled {
-                " (diarization enabled)"
-            } else {
-                ""
-            }
-        ),
-    );
-    let _ = append_performance_log_to_job(
-        shared,
-        job_id,
-        "preflight",
-        if job.diarization_enabled {
-            "Diarization is enabled for this job. Vukho.AI will require WhisperX to pass a CUDA preflight before it is allowed to run; otherwise it will fall back to faster-whisper without diarization."
-        } else {
-            "Diarization is disabled for this job. Vukho.AI will run the faster-whisper path first and record a CUDA preflight before transcription starts."
-        },
-    );
-
     let mut command = Command::new(&python_binary);
     configure_python_command(&mut command, &python_binary);
     command
@@ -1326,7 +1412,7 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
         .arg("--language")
         .arg(job.language_mode.python_flag())
         .arg("--diarization")
-        .arg(if job.diarization_enabled { "on" } else { "off" })
+        .arg("on")
         .arg("--duration-seconds")
         .arg(format!("{:.3}", prepared.duration_seconds))
         .stdout(Stdio::piped())
@@ -1764,24 +1850,22 @@ fn output_txt_path(settings: &AppSettings, job: &ImportJob) -> String {
 fn resolve_python_binary(
     settings: &AppSettings,
     script_path: &Path,
-    diarization_enabled: bool,
+    _diarization_enabled: bool,
 ) -> Result<String, String> {
     let mut candidates: Vec<String> = Vec::new();
 
-    if diarization_enabled {
-        if let Some(value) = settings
-            .diarization_python_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
-            candidates.push(value.to_string());
-        }
+    if let Some(value) = settings
+        .diarization_python_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        candidates.push(value.to_string());
+    }
 
-        if let Ok(env_python) = std::env::var("VUKHOAI_DIARIZATION_PYTHON") {
-            if !env_python.trim().is_empty() {
-                candidates.push(env_python);
-            }
+    if let Ok(env_python) = std::env::var("VUKHOAI_DIARIZATION_PYTHON") {
+        if !env_python.trim().is_empty() {
+            candidates.push(env_python);
         }
     }
 
@@ -1800,15 +1884,11 @@ fn resolve_python_binary(
         }
     }
 
-    candidates.extend(discover_local_python_candidates(
-        script_path,
-        diarization_enabled,
-    ));
+    candidates.extend(discover_local_python_candidates(script_path, true));
     candidates.push("python3".to_string());
     candidates.push("python".to_string());
 
     let mut seen: HashSet<String> = HashSet::new();
-    let mut transcription_capable_fallback: Option<String> = None;
     let mut missing_transcription_for: Vec<String> = Vec::new();
     let mut missing_diarization_for: Vec<String> = Vec::new();
 
@@ -1821,43 +1901,33 @@ fn resolve_python_binary(
             continue;
         };
 
-        if diarization_enabled && capabilities.supports_diarization() {
+        if capabilities.supports_diarization() {
             return Ok(candidate);
         }
 
         if capabilities.supports_transcription() {
-            if transcription_capable_fallback.is_none() {
-                transcription_capable_fallback = Some(candidate.clone());
-            }
-
-            if diarization_enabled && !capabilities.supports_diarization() {
-                missing_diarization_for.push(candidate);
-            }
+            missing_diarization_for.push(candidate);
             continue;
         }
 
         missing_transcription_for.push(candidate);
     }
 
-    if let Some(candidate) = transcription_capable_fallback {
-        return Ok(candidate);
-    }
-
-    if !missing_transcription_for.is_empty() {
+    if !missing_diarization_for.is_empty() {
         return Err(format!(
-            "Transcription runtime is not ready. Reinstall the Windows portable package or choose a working runtime in Settings. Checked runtimes: {}",
-            missing_transcription_for.join(", ")
-        ));
-    }
-
-    if diarization_enabled && !missing_diarization_for.is_empty() {
-        return Err(format!(
-            "Diarization runtime is not ready. The app can still transcribe without diarization, or you can choose a working diarization runtime in Settings. Checked runtimes: {}",
+            "Mandatory diarization runtime is not ready. Audio processing will not start until WhisperX and pyannote are available in a working GPU runtime. Checked runtimes: {}",
             missing_diarization_for.join(", ")
         ));
     }
 
-    Err("Bundled transcription runtime was not found. Reinstall the Windows portable package or choose a working runtime in Settings.".to_string())
+    if !missing_transcription_for.is_empty() {
+        return Err(format!(
+            "Mandatory transcription + diarization runtime is not ready. Audio processing will not start. Checked runtimes: {}",
+            missing_transcription_for.join(", ")
+        ));
+    }
+
+    Err("Bundled diarization runtime was not found. Reinstall the Windows portable package or choose a working runtime in Settings.".to_string())
 }
 
 fn configure_python_command(command: &mut Command, python_binary: &str) {
@@ -1910,10 +1980,36 @@ def can_import(name, attr=None):
     except Exception:
         return False
 
+def torch_cuda_state():
+    try:
+        import torch
+        available = bool(torch.cuda.is_available())
+        count = int(torch.cuda.device_count()) if available else 0
+        if available and count > 0:
+            torch.cuda.init()
+            probe = torch.zeros(1, device="cuda:0")
+            _ = probe + 1
+            torch.cuda.synchronize(0)
+        return available, count
+    except Exception:
+        return False, 0
+
+def ctranslate2_cuda_count():
+    try:
+        import ctranslate2
+        return int(ctranslate2.get_cuda_device_count())
+    except Exception:
+        return 0
+
+torch_cuda_available, torch_cuda_device_count = torch_cuda_state()
+
 print(json.dumps({
     "faster_whisper": can_import("faster_whisper", "WhisperModel"),
     "whisperx": can_import("whisperx"),
     "pyannote_audio": can_import("pyannote.audio"),
+    "torch_cuda_available": torch_cuda_available,
+    "torch_cuda_device_count": torch_cuda_device_count,
+    "ctranslate2_cuda_device_count": ctranslate2_cuda_count(),
 }))
 "#;
 
@@ -1930,6 +2026,9 @@ print(json.dumps({
         has_faster_whisper: parsed.faster_whisper,
         has_whisperx: parsed.whisperx,
         has_pyannote_audio: parsed.pyannote_audio,
+        torch_cuda_available: parsed.torch_cuda_available,
+        torch_cuda_device_count: parsed.torch_cuda_device_count,
+        ctranslate2_cuda_device_count: parsed.ctranslate2_cuda_device_count,
     })
 }
 
@@ -2417,19 +2516,17 @@ fn migrate_persisted_state(persisted: &mut PersistedState) {
     }
 
     if persisted.schema_version < 3 {
-        let diarization_python_missing = persisted
-            .settings
-            .diarization_python_path
-            .as_deref()
-            .map(str::trim)
-            .map(|value| value.is_empty())
-            .unwrap_or(true);
-
-        if diarization_python_missing {
-            persisted.settings.diarization_enabled = false;
-        }
-
         persisted.schema_version = 3;
+    }
+
+    if persisted.schema_version < 4 {
+        persisted.settings.diarization_enabled = true;
+        for job in &mut persisted.jobs {
+            if matches!(job.status, JobStatus::Queued | JobStatus::Processing) {
+                job.diarization_enabled = true;
+            }
+        }
+        persisted.schema_version = 4;
     }
 
     if persisted.schema_version < STATE_SCHEMA_VERSION {
@@ -2444,7 +2541,7 @@ fn build_job_notice(core: &AppCore, meta_path: &str) -> Option<String> {
         return None;
     }
 
-    let mut message = String::from("Diarization was skipped.");
+    let mut message = String::from("Diarization did not complete.");
     let fallback_event = metadata
         .fallback_events
         .iter()
@@ -2476,7 +2573,7 @@ fn build_job_notice(core: &AppCore, meta_path: &str) -> Option<String> {
     if missing_stack {
         message.push(' ');
         message.push_str(
-            "Speaker diarization runtime is unavailable. Transcription still finished, but without speaker separation. Reinstall the Windows package, or if you manage your own Python runtimes, choose a working diarization runtime in Settings.",
+            "Speaker diarization is mandatory. Reinstall the Windows package, or if you manage your own Python runtimes, choose a working diarization runtime in Settings.",
         );
     }
 

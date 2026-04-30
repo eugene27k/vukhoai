@@ -37,7 +37,7 @@ Included:
 
 - default profile
 - language mode
-- diarization on/off
+- mandatory speaker diarization
 - Hugging Face token
 - OpenAI model
 - OpenAI API key
@@ -98,7 +98,7 @@ If you explicitly want to compile locally from source, run:
 powershell -ExecutionPolicy Bypass -File .\Scripts\build_windows_portable.ps1 -FfmpegDir "C:\path\to\ffmpeg\bin"
 ```
 
-If you deliberately want a smaller transcription-only package, add `-SkipDiarizationRuntime`.
+`-SkipDiarizationRuntime` is rejected by the build script because normal jobs require diarization.
 
 Output:
 

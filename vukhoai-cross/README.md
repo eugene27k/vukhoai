@@ -19,7 +19,7 @@ Cross-platform desktop app (macOS + Windows target) for local/offline transcript
 - Settings modal:
   - quality profile
   - language mode
-  - diarization on/off
+  - mandatory speaker diarization
   - output folder
   - optional Python path
   - optional diarization Python path
@@ -44,7 +44,7 @@ source .venv/bin/activate
 pip install -r Scripts/requirements.txt
 ```
 
-Optional for real speaker diarization (`whisperx` + `pyannote`):
+Required for speaker diarization (`whisperx` + `pyannote`):
 
 ```bash
 cd ".."
