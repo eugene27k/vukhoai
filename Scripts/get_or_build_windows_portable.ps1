@@ -125,7 +125,7 @@ function Test-LocalBuildPrerequisites {
   return (Test-CommandExists "cargo") -and (Test-CommandExists "npm") -and $hasPython
 }
 
-function Invoke-PortableDownload {
+function Invoke-PortableDownloadOnce {
   param(
     [string]$Uri,
     [string]$OutFile
@@ -177,6 +177,10 @@ function Invoke-PortableDownload {
       -TotalBytes $totalBytes `
       -Elapsed $stopwatch.Elapsed `
       -ProgressId 1
+
+    if ($null -ne $totalBytes -and [Int64]$totalBytes -gt 0 -and $bytesReceived -ne [Int64]$totalBytes) {
+      throw "Download incomplete for $Uri. Expected $totalBytes bytes, got $bytesReceived bytes."
+    }
   }
   finally {
     Write-Progress -Id 1 -Activity "Downloading ready-made Windows build" -Completed
@@ -198,6 +202,45 @@ function Invoke-PortableDownload {
   }
 }
 
+function Invoke-PortableDownload {
+  param(
+    [string]$Uri,
+    [string]$OutFile,
+    [int]$Attempts = 3
+  )
+
+  $parent = Split-Path -Parent $OutFile
+  if (-not [string]::IsNullOrWhiteSpace($parent)) {
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+  }
+
+  $tempOutFile = "$OutFile.download"
+  $lastError = $null
+
+  for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+    Remove-Item $tempOutFile -Force -ErrorAction SilentlyContinue
+
+    try {
+      if ($attempt -gt 1) {
+        Write-Host "Retrying download ($attempt of $Attempts): $([System.IO.Path]::GetFileName($OutFile))"
+      }
+
+      Invoke-PortableDownloadOnce -Uri $Uri -OutFile $tempOutFile
+      Move-Item -LiteralPath $tempOutFile -Destination $OutFile -Force
+      return
+    } catch {
+      $lastError = $_.Exception.Message
+      Remove-Item $tempOutFile -Force -ErrorAction SilentlyContinue
+
+      if ($attempt -lt $Attempts) {
+        Start-Sleep -Seconds ([Math]::Min(2 * $attempt, 8))
+      }
+    }
+  }
+
+  throw "Download failed after $Attempts attempts for $Uri. Last error: $lastError"
+}
+
 function Join-PortableReleaseParts {
   param(
     [string]$ManifestPath,
@@ -217,7 +260,16 @@ function Join-PortableReleaseParts {
     throw "Release manifest does not contain any parts."
   }
 
-  if (Test-Path $ZipPath) {
+  if ($manifest.archive_bytes -and (Test-Path $ZipPath)) {
+    $expectedArchiveBytes = [Int64]$manifest.archive_bytes
+    $actualArchiveBytes = (Get-Item $ZipPath).Length
+    if ($expectedArchiveBytes -eq $actualArchiveBytes) {
+      Write-Host "Using cached release archive: $([System.IO.Path]::GetFileName($ZipPath))"
+      return
+    }
+
+    Remove-Item $ZipPath -Force
+  } elseif (Test-Path $ZipPath) {
     Remove-Item $ZipPath -Force
   }
 
@@ -240,8 +292,31 @@ function Join-PortableReleaseParts {
 
       $partPath = Join-Path $DownloadRoot $partName
       $partUrl = "https://github.com/$Repository/releases/download/$ReleaseTag/$partName"
-      Write-PrepareProgress -Status "Downloading release part $partIndex of $($parts.Count)..." -PercentComplete (10 + [Math]::Min([int](($partIndex * 40.0) / [Math]::Max($parts.Count, 1)), 40))
-      Invoke-PortableDownload -Uri $partUrl -OutFile $partPath
+      $partReady = $false
+
+      if ((Test-Path $partPath) -and $part.bytes) {
+        $expectedPartBytes = [Int64]$part.bytes
+        $actualPartBytes = (Get-Item $partPath).Length
+        if ($expectedPartBytes -eq $actualPartBytes) {
+          Write-Host "Using cached release part $partIndex of $($parts.Count): $partName"
+          $partReady = $true
+        } else {
+          Remove-Item $partPath -Force
+        }
+      }
+
+      if (-not $partReady) {
+        Write-PrepareProgress -Status "Downloading release part $partIndex of $($parts.Count)..." -PercentComplete (10 + [Math]::Min([int](($partIndex * 40.0) / [Math]::Max($parts.Count, 1)), 40))
+        Invoke-PortableDownload -Uri $partUrl -OutFile $partPath
+      }
+
+      if ($part.bytes) {
+        $expectedPartBytes = [Int64]$part.bytes
+        $actualPartBytes = (Get-Item $partPath).Length
+        if ($expectedPartBytes -ne $actualPartBytes) {
+          throw "Release part size mismatch for $partName. Expected $expectedPartBytes bytes, got $actualPartBytes bytes."
+        }
+      }
 
       $inputStream = [System.IO.File]::OpenRead($partPath)
       try {
@@ -294,7 +369,7 @@ function Repair-PortableLayoutIfNeeded {
 function Resolve-PortableExe {
   param([string]$PortableRoot)
 
-  return Get-ChildItem -Path $PortableRoot -Filter "*.exe" -File -Recurse -ErrorAction SilentlyContinue |
+  return Get-ChildItem -Path $PortableRoot -Filter "*.exe" -File -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -notmatch "(?i)(setup|installer|updater)" } |
     Sort-Object FullName |
     Select-Object -First 1
@@ -366,11 +441,11 @@ if missing:
       Write-Host $stdoutText.TrimEnd()
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($stderrText)) {
-      Write-Host $stderrText.TrimEnd()
-    }
-
     if ($process.ExitCode -ne 0) {
+      if (-not [string]::IsNullOrWhiteSpace($stderrText)) {
+        Write-Host $stderrText.TrimEnd()
+      }
+
       $detail = @($stdoutText, $stderrText) -join [Environment]::NewLine
       $detail = $detail.Trim()
       if ([string]::IsNullOrWhiteSpace($detail)) {
@@ -464,11 +539,11 @@ print(
       Write-Host $stdoutText.TrimEnd()
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($stderrText)) {
-      Write-Host $stderrText.TrimEnd()
-    }
-
     if ($process.ExitCode -ne 0) {
+      if (-not [string]::IsNullOrWhiteSpace($stderrText)) {
+        Write-Host $stderrText.TrimEnd()
+      }
+
       $detail = @($stdoutText, $stderrText) -join [Environment]::NewLine
       $detail = $detail.Trim()
       if ([string]::IsNullOrWhiteSpace($detail)) {
@@ -568,17 +643,15 @@ if (-not $ForceLocalBuild) {
     New-Item -ItemType Directory -Force -Path $downloadRoot | Out-Null
     New-Item -ItemType Directory -Force -Path $windowsRoot | Out-Null
 
-    if (Test-Path $zipPath) {
-      Remove-Item $zipPath -Force
-    }
-
     if (Test-Path $manifestPath) {
       Remove-Item $manifestPath -Force
     }
 
+    $manifestDownloaded = $false
     try {
       Write-PrepareProgress -Status "Downloading release manifest..." -PercentComplete 15
       Invoke-PortableDownload -Uri $manifestUrl -OutFile $manifestPath
+      $manifestDownloaded = $true
       Join-PortableReleaseParts `
         -ManifestPath $manifestPath `
         -DownloadRoot $downloadRoot `
@@ -586,6 +659,10 @@ if (-not $ForceLocalBuild) {
         -Repository $Repository `
         -ReleaseTag $ReleaseTag
     } catch {
+      if ($manifestDownloaded) {
+        throw
+      }
+
       if (Test-Path $manifestPath) {
         Remove-Item $manifestPath -Force -ErrorAction SilentlyContinue
       }
@@ -595,7 +672,25 @@ if (-not $ForceLocalBuild) {
     }
 
     if (Test-Path $portableRoot) {
-      Remove-Item $portableRoot -Recurse -Force
+      try {
+        Write-PrepareProgress -Status "Validating cached Windows app..." -PercentComplete 75
+        $portableExe = Assert-PortablePackageReady -PortableRoot $portableRoot
+
+        Write-PrepareProgress -Status "Windows portable app is ready." -PercentComplete 100
+        Write-Host "Ready-to-run Windows app is already available."
+        Write-Host "Path: $portableRoot"
+
+        if ($OpenFolder) {
+          Invoke-Item $portableRoot
+        } else {
+          Invoke-Item $portableExe.FullName
+        }
+
+        exit 0
+      } catch {
+        Write-Host "Cached Windows app is not valid yet; refreshing extracted files."
+        Remove-Item $portableRoot -Recurse -Force
+      }
     }
 
     Write-PrepareProgress -Status "Expanding downloaded archive..." -PercentComplete 80
