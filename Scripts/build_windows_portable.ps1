@@ -36,6 +36,37 @@ function Require-Command {
   return $command.Source
 }
 
+function Resolve-FfmpegDirectory {
+  $ffmpegCommand = Get-Command "ffmpeg.exe" -ErrorAction SilentlyContinue
+  $ffprobeCommand = Get-Command "ffprobe.exe" -ErrorAction SilentlyContinue
+  if (-not $ffmpegCommand -or -not $ffprobeCommand) {
+    return ""
+  }
+
+  $chocolateyInstall = if ($env:ChocolateyInstall) {
+    $env:ChocolateyInstall
+  } else {
+    "C:\ProgramData\chocolatey"
+  }
+  $chocolateyShimDir = Join-Path $chocolateyInstall "bin"
+  $chocolateyFfmpegDir = Join-Path $chocolateyInstall "lib\ffmpeg\tools\ffmpeg\bin"
+  $ffmpegSource = [System.IO.Path]::GetFullPath($ffmpegCommand.Source)
+  $shimPrefix = [System.IO.Path]::GetFullPath($chocolateyShimDir).TrimEnd('\') + '\'
+
+  if ($ffmpegSource.StartsWith($shimPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and
+      (Test-Path (Join-Path $chocolateyFfmpegDir "ffmpeg.exe")) -and
+      (Test-Path (Join-Path $chocolateyFfmpegDir "ffprobe.exe"))) {
+    return $chocolateyFfmpegDir
+  }
+
+  $candidateFfmpegDir = Split-Path -Parent $ffmpegCommand.Source
+  if (Test-Path (Join-Path $candidateFfmpegDir "ffprobe.exe")) {
+    return $candidateFfmpegDir
+  }
+
+  return ""
+}
+
 function Write-Step {
   param([string]$Message)
 
@@ -724,14 +755,7 @@ $null = Require-Command -Name "npm" -Hint "Install Node.js 20+ first."
 $pythonLauncher = Resolve-PythonLauncher
 
 if (-not $FfmpegDir) {
-  $ffmpegCommand = Get-Command "ffmpeg.exe" -ErrorAction SilentlyContinue
-  $ffprobeCommand = Get-Command "ffprobe.exe" -ErrorAction SilentlyContinue
-  if ($ffmpegCommand -and $ffprobeCommand) {
-    $candidateFfmpegDir = Split-Path -Parent $ffmpegCommand.Source
-    if (Test-Path (Join-Path $candidateFfmpegDir "ffprobe.exe")) {
-      $FfmpegDir = $candidateFfmpegDir
-    }
-  }
+  $FfmpegDir = Resolve-FfmpegDirectory
 }
 
 Write-BuildProgress -Status "Preparing Python build environment..." -PercentComplete 12
@@ -819,10 +843,15 @@ if ($FfmpegDir) {
   Write-BuildProgress -Status "Copying ffmpeg binaries into the portable package..." -PercentComplete 98
   foreach ($binaryName in @("ffmpeg.exe", "ffprobe.exe")) {
     $sourceBinary = Join-Path $FfmpegDir $binaryName
-    if (Test-Path $sourceBinary) {
-      Copy-Item $sourceBinary (Join-Path $portableRoot $binaryName) -Force
+    if (-not (Test-Path $sourceBinary)) {
+      throw "Expected $binaryName in FfmpegDir: $FfmpegDir"
     }
+
+    Copy-Item $sourceBinary (Join-Path $portableRoot $binaryName) -Force
   }
+
+  Invoke-NativeCommand -FilePath (Join-Path $portableRoot "ffmpeg.exe") -ArgumentList @("-version")
+  Invoke-NativeCommand -FilePath (Join-Path $portableRoot "ffprobe.exe") -ArgumentList @("-version")
 }
 
 Write-BuildProgress -Status "Writing portable package manifest..." -PercentComplete 99
@@ -831,7 +860,7 @@ Write-PortablePackageManifest `
   -ExecutableName $releaseExe.Name `
   -PythonVersion $PortablePythonVersion `
   -HasDiarizationRuntime ($null -ne $diarizationPython -and (Test-Path $diarizationPython)) `
-  -HasFfmpeg (Test-Path (Join-Path $portableRoot "ffmpeg.exe"))
+  -HasFfmpeg ((Test-Path (Join-Path $portableRoot "ffmpeg.exe")) -and (Test-Path (Join-Path $portableRoot "ffprobe.exe")))
 
 Write-Progress -Id 0 -Activity $buildProgressActivity -Status "Portable Windows build is ready." -PercentComplete 100
 Write-Host ""
