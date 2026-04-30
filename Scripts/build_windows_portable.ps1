@@ -139,8 +139,14 @@ function Invoke-NativeCommand {
     [string[]]$ArgumentList = @()
   )
 
-  $output = & $FilePath @ArgumentList 2>&1
-  $exitCode = $LASTEXITCODE
+  $previousErrorActionPreference = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    $output = & $FilePath @ArgumentList 2>&1
+    $exitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+  }
 
   if ($null -ne $output) {
     foreach ($line in $output) {
@@ -716,6 +722,18 @@ Write-BuildProgress -Status "Checking local build prerequisites..." -PercentComp
 $null = Require-Command -Name "cargo" -Hint "Install Rust with rustup first."
 $null = Require-Command -Name "npm" -Hint "Install Node.js 20+ first."
 $pythonLauncher = Resolve-PythonLauncher
+
+if (-not $FfmpegDir) {
+  $ffmpegCommand = Get-Command "ffmpeg.exe" -ErrorAction SilentlyContinue
+  $ffprobeCommand = Get-Command "ffprobe.exe" -ErrorAction SilentlyContinue
+  if ($ffmpegCommand -and $ffprobeCommand) {
+    $candidateFfmpegDir = Split-Path -Parent $ffmpegCommand.Source
+    if (Test-Path (Join-Path $candidateFfmpegDir "ffprobe.exe")) {
+      $FfmpegDir = $candidateFfmpegDir
+    }
+  }
+}
+
 Write-BuildProgress -Status "Preparing Python build environment..." -PercentComplete 12
 $buildPython = Ensure-BuildVenv `
   -PythonLauncher $pythonLauncher `
@@ -738,7 +756,7 @@ try {
   }
 
   Write-BuildProgress -Status "Compiling the Tauri Windows app..." -PercentComplete 45
-  Invoke-NativeCommand -FilePath "npm" -ArgumentList @("run", "tauri", "build", "--", "--no-bundle")
+  Invoke-NativeCommand -FilePath "npm" -ArgumentList @("run", "tauri", "--", "build", "--no-bundle")
 }
 finally {
   Pop-Location

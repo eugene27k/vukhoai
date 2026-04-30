@@ -6,7 +6,7 @@ import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 import earLogo from "./assets/vukho-ear-logo.svg";
 
-type JobStatus = "queued" | "processing" | "done" | "failed" | "cancelled";
+type JobStatus = "ready" | "queued" | "processing" | "done" | "failed" | "cancelled";
 type Profile = "maximum_quality" | "balanced" | "fast_economy";
 type LanguageMode = "auto" | "ukrainian";
 type ThemeMode = "dark" | "light";
@@ -74,6 +74,16 @@ interface AppSnapshot {
   settings: AppSettings;
 }
 
+interface RecordingState {
+  active: boolean;
+  id?: string | null;
+  title?: string | null;
+  started_at?: string | null;
+  elapsed_seconds?: number | null;
+  system_device?: string | null;
+  microphone_device?: string | null;
+}
+
 type ListFilter = "all" | "completed_only";
 type RuntimeTone = "gpu" | "cpu" | "detecting";
 
@@ -121,6 +131,9 @@ function App() {
   const [liveTick, setLiveTick] = useState<number>(Date.now());
   const [themeMode, setThemeMode] = useState<ThemeMode>(resolveInitialThemeMode);
   const [dragActive, setDragActive] = useState(false);
+  const [recordingTitle, setRecordingTitle] = useState("");
+  const [recordingState, setRecordingState] = useState<RecordingState>({ active: false });
+  const [recordingBusy, setRecordingBusy] = useState(false);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState<AppSettings | null>(null);
@@ -156,9 +169,22 @@ function App() {
   }, [jobs, listFilter]);
 
   const hasQueuedOrProcessingJobs = useMemo(
-    () => jobs.some((job) => job.status === "queued" || job.status === "processing"),
+    () => jobs.some((job) => job.status === "ready" || job.status === "queued" || job.status === "processing"),
     [jobs],
   );
+
+  const recordingElapsedSeconds = useMemo(() => {
+    if (!recordingState.active) {
+      return recordingState.elapsed_seconds ?? 0;
+    }
+
+    const startedAt = recordingState.started_at ? Date.parse(recordingState.started_at) : NaN;
+    if (Number.isFinite(startedAt)) {
+      return Math.max(0, (liveTick - startedAt) / 1000);
+    }
+
+    return recordingState.elapsed_seconds ?? 0;
+  }, [recordingState, liveTick]);
 
   const loadInitialState = useCallback(async () => {
     const snapshot = await invoke<AppSnapshot>("get_state");
@@ -206,10 +232,11 @@ function App() {
 
   useEffect(() => {
     void loadInitialState();
+    void refreshRecordingState();
 
     const interval = setInterval(() => {
       setLiveTick(Date.now());
-    }, 5000);
+    }, 1000);
 
     let stopJobs: (() => void) | null = null;
     let stopSettings: (() => void) | null = null;
@@ -231,6 +258,15 @@ function App() {
       stopSettings?.();
     };
   }, [loadInitialState]);
+
+  async function refreshRecordingState() {
+    try {
+      const state = await invoke<RecordingState>("get_recording_state");
+      setRecordingState(state);
+    } catch {
+      setRecordingState({ active: false });
+    }
+  }
 
   useEffect(() => {
     document.documentElement.dataset.theme = themeMode;
@@ -414,6 +450,87 @@ function App() {
       await invoke("retry_job", { jobId });
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function queueReadyJob(jobId: string) {
+    setErrorMessage("");
+    try {
+      await invoke("queue_ready_job", { jobId });
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function startRecording() {
+    if (recordingBusy || recordingState.active) {
+      return;
+    }
+
+    setErrorMessage("");
+    setRecordingBusy(true);
+    try {
+      const state = await invoke<RecordingState>("start_recording", {
+        title: recordingTitle,
+      });
+      setRecordingState(state);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRecordingBusy(false);
+    }
+  }
+
+  async function stopRecording() {
+    if (recordingBusy || !recordingState.active) {
+      return;
+    }
+
+    setErrorMessage("");
+    setRecordingBusy(true);
+    try {
+      const job = await invoke<ImportJob>("stop_recording");
+      setRecordingState({ active: false });
+      setRecordingTitle("");
+
+      const accepted = await confirm(`Transcribe "${job.input_filename}" now?`, {
+        title: "Recording Saved",
+        kind: "info",
+      });
+      if (accepted) {
+        await invoke("queue_ready_job", { jobId: job.id });
+      }
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : String(error));
+      await refreshRecordingState();
+    } finally {
+      setRecordingBusy(false);
+    }
+  }
+
+  async function cancelRecording() {
+    if (recordingBusy || !recordingState.active) {
+      return;
+    }
+
+    const accepted = await confirm("Cancel this recording and delete the temporary audio?", {
+      title: "Cancel Recording",
+      kind: "warning",
+    });
+    if (!accepted) {
+      return;
+    }
+
+    setErrorMessage("");
+    setRecordingBusy(true);
+    try {
+      await invoke("cancel_recording");
+      setRecordingState({ active: false });
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : String(error));
+      await refreshRecordingState();
+    } finally {
+      setRecordingBusy(false);
     }
   }
 
@@ -690,6 +807,54 @@ function App() {
         </div>
       </header>
 
+      <section className={`panel record-panel ${recordingState.active ? "recording-active" : ""}`}>
+        <div className="record-header">
+          <div>
+            <h2>Record</h2>
+            <p>Capture computer audio and microphone into a ready-to-transcribe `.m4a` file.</p>
+          </div>
+          <div className={`record-live ${recordingState.active ? "on" : ""}`}>
+            <span className="record-dot" aria-hidden="true" />
+            <span>{recordingState.active ? "Recording" : "Idle"}</span>
+          </div>
+        </div>
+
+        <div className="record-controls">
+          <label className="record-title-field">
+            <span>Title</span>
+            <input
+              type="text"
+              value={recordingTitle}
+              placeholder="Meeting, call, lecture..."
+              disabled={recordingState.active || recordingBusy}
+              onChange={(event) => setRecordingTitle(event.target.value)}
+            />
+          </label>
+          <div className="record-timer">{formatClock(recordingElapsedSeconds)}</div>
+          <div className="record-actions">
+            {!recordingState.active ? (
+              <button className="primary" onClick={startRecording} disabled={recordingBusy}>
+                {recordingBusy ? "Starting..." : "Start Recording"}
+              </button>
+            ) : (
+              <>
+                <button className="primary" onClick={stopRecording} disabled={recordingBusy}>
+                  {recordingBusy ? "Saving..." : "Stop & Save"}
+                </button>
+                <button onClick={cancelRecording} disabled={recordingBusy}>
+                  Cancel
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+
+        <div className="record-devices">
+          <span>System: {recordingState.system_device || "default output"}</span>
+          <span>Mic: {recordingState.microphone_device || "default microphone"}</span>
+        </div>
+      </section>
+
       <section className={`panel import-panel ${dragActive ? "drag-active" : ""}`}>
         <h2>Import</h2>
         <div className="import-drop-note">
@@ -817,6 +982,10 @@ function App() {
                         <button onClick={() => openTranscript(job.id)}>Open</button>
                         <button onClick={() => reTranscribe(job.id)}>Re-transcribe</button>
                       </>
+                    )}
+
+                    {job.status === "ready" && (
+                      <button onClick={() => queueReadyJob(job.id)}>Transcribe</button>
                     )}
 
                     {job.status === "queued" && (

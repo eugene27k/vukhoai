@@ -40,6 +40,14 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Ensure ffmpeg is available for recording support
+        run: |
+          if (-not (Get-Command ffmpeg.exe -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg -y --no-progress
+          }
+          ffmpeg -version
+          ffprobe -version
+
       - name: Seed portable settings from repository secrets
         run: |
           $portableDir = Join-Path $PWD "vukhoai-cross\portable-build"

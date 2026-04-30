@@ -13,10 +13,12 @@ use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
+mod recording;
+
 const JOBS_EVENT: &str = "vukhoai://jobs-updated";
 const SETTINGS_EVENT: &str = "vukhoai://settings-updated";
 const PORTABLE_STATE_FILE_NAME: &str = "portable-state.json";
-const STATE_SCHEMA_VERSION: u32 = 4;
+const STATE_SCHEMA_VERSION: u32 = 5;
 const MAX_PERFORMANCE_LOG_ENTRIES: usize = 80;
 const PERFORMANCE_GAP_WARNING_SECONDS: i64 = 15 * 60;
 const PERFORMANCE_PROGRESS_MILESTONE_STEP: f64 = 25.0;
@@ -38,6 +40,7 @@ fn legacy_state_schema_version() -> u32 {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum JobStatus {
+    Ready,
     Queued,
     Processing,
     Done,
@@ -229,7 +232,9 @@ struct AppCore {
     store_path: PathBuf,
     normalized_dir: PathBuf,
     metadata_dir: PathBuf,
+    recording_temp_dir: PathBuf,
     script_path: PathBuf,
+    recording: recording::RecordingManager,
     worker: Mutex<WorkerState>,
 }
 
@@ -258,6 +263,12 @@ struct RuntimePayload {
 struct DiagnosticPayload {
     kind: Option<String>,
     message: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NewJobMode {
+    Ready,
+    Queued,
 }
 
 #[derive(Debug)]
@@ -492,8 +503,7 @@ fn update_settings(
     Ok(updated)
 }
 
-#[tauri::command]
-fn enqueue_job(state: State<'_, AppShared>, input_path: String) -> Result<ImportJob, String> {
+fn validate_import_path(input_path: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(input_path.trim());
     if !path.exists() {
         return Err("Input file does not exist.".to_string());
@@ -508,14 +518,16 @@ fn enqueue_job(state: State<'_, AppShared>, input_path: String) -> Result<Import
         return Err("Unsupported format. Use .m4a or .mp4.".to_string());
     }
 
-    let mut guard = state
-        .core
-        .worker
-        .lock()
-        .map_err(|_| "Failed to lock state".to_string())?;
-    let settings = guard.persisted.settings.clone();
+    Ok(path)
+}
 
-    let job = ImportJob {
+fn build_import_job(
+    path: &Path,
+    settings: &AppSettings,
+    mode: NewJobMode,
+    duration_seconds: Option<f64>,
+) -> ImportJob {
+    ImportJob {
         id: Uuid::new_v4().to_string(),
         input_path: path.to_string_lossy().into_owned(),
         input_filename: path
@@ -524,9 +536,12 @@ fn enqueue_job(state: State<'_, AppShared>, input_path: String) -> Result<Import
             .unwrap_or("input")
             .to_string(),
         normalized_audio_path: None,
-        status: JobStatus::Queued,
+        status: match mode {
+            NewJobMode::Ready => JobStatus::Ready,
+            NewJobMode::Queued => JobStatus::Queued,
+        },
         created_at: Utc::now(),
-        duration_seconds: None,
+        duration_seconds,
         profile: settings.default_profile,
         language_mode: settings.language_mode,
         diarization_enabled: true,
@@ -554,17 +569,111 @@ fn enqueue_job(state: State<'_, AppShared>, input_path: String) -> Result<Import
         last_progress_log_at: None,
         last_progress_log_stage: None,
         last_progress_log_percent: None,
-    };
+    }
+}
+
+fn insert_import_job(
+    shared: &AppShared,
+    path: &Path,
+    mode: NewJobMode,
+    duration_seconds: Option<f64>,
+) -> Result<ImportJob, String> {
+    let mut guard = shared
+        .core
+        .worker
+        .lock()
+        .map_err(|_| "Failed to lock state".to_string())?;
+    let settings = guard.persisted.settings.clone();
+
+    let job = build_import_job(path, &settings, mode, duration_seconds);
 
     guard.persisted.jobs.push(job.clone());
     guard.persisted.jobs.sort_by_key(|j| j.created_at);
     drop(guard);
 
+    persist_state(&shared.core)?;
+    emit_full_state(&shared.core);
+
+    Ok(job)
+}
+
+#[tauri::command]
+fn enqueue_job(state: State<'_, AppShared>, input_path: String) -> Result<ImportJob, String> {
+    let path = validate_import_path(&input_path)?;
+    let job = insert_import_job(state.inner(), &path, NewJobMode::Queued, None)?;
+    ensure_worker_running(state.inner().clone());
+    Ok(job)
+}
+
+#[tauri::command]
+fn queue_ready_job(state: State<'_, AppShared>, job_id: String) -> Result<(), String> {
+    let mut guard = state
+        .core
+        .worker
+        .lock()
+        .map_err(|_| "Failed to lock state".to_string())?;
+    let Some(job) = guard.persisted.jobs.iter_mut().find(|j| j.id == job_id) else {
+        return Err("Job not found.".to_string());
+    };
+
+    if job.status != JobStatus::Ready {
+        return Err("Only ready recordings can be queued.".to_string());
+    }
+
+    job.status = JobStatus::Queued;
+    job.error_message = None;
+    job.notice_message = None;
+    job.diarization_enabled = true;
+    drop(guard);
+
     persist_state(&state.core)?;
     emit_full_state(&state.core);
     ensure_worker_running(state.inner().clone());
+    Ok(())
+}
 
+#[tauri::command]
+fn get_recording_state(state: State<'_, AppShared>) -> recording::RecordingSnapshot {
+    state.core.recording.snapshot()
+}
+
+#[tauri::command]
+fn start_recording(
+    state: State<'_, AppShared>,
+    title: String,
+) -> Result<recording::RecordingSnapshot, String> {
+    let output_folder_path = {
+        let guard = state
+            .core
+            .worker
+            .lock()
+            .map_err(|_| "Failed to lock state".to_string())?;
+        guard.persisted.settings.output_folder_path.clone()
+    };
+    let recordings_dir = Path::new(&output_folder_path).join("Recordings");
+
+    state
+        .core
+        .recording
+        .start(&title, &recordings_dir, &state.core.recording_temp_dir)
+}
+
+#[tauri::command]
+fn stop_recording(state: State<'_, AppShared>) -> Result<ImportJob, String> {
+    let ffmpeg_binary = resolve_runtime_binary(FFMPEG_BINARY_NAME);
+    let finished = state.core.recording.stop(&ffmpeg_binary)?;
+    let job = insert_import_job(
+        state.inner(),
+        &finished.path,
+        NewJobMode::Ready,
+        finished.duration_seconds,
+    )?;
     Ok(job)
+}
+
+#[tauri::command]
+fn cancel_recording(state: State<'_, AppShared>) -> Result<(), String> {
+    state.core.recording.cancel()
 }
 
 #[tauri::command]
@@ -671,7 +780,7 @@ fn cancel_job(state: State<'_, AppShared>, job_id: String) -> Result<(), String>
             job.last_progress_log_stage = None;
             job.last_progress_log_percent = None;
         }
-        JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled => {}
+        JobStatus::Ready | JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled => {}
     }
 
     drop(guard);
@@ -1274,7 +1383,11 @@ fn run_mandatory_runtime_preflight(
         .map_err(|e| format!("Unable to start mandatory runtime preflight: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut stdout_non_progress: Vec<String> = Vec::new();
-    for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         if !apply_runtime_line(shared, job_id, line) {
             stdout_non_progress.push(line.to_string());
         }
@@ -2448,11 +2561,14 @@ fn build_shared_state(app: &tauri::App) -> Result<AppShared, String> {
     let store_path = app_data.join("state.json");
     let normalized_dir = app_data.join("normalized_audio");
     let metadata_dir = app_data.join("metadata");
+    let recording_temp_dir = app_data.join("recording_temp");
 
     fs::create_dir_all(&normalized_dir)
         .map_err(|e| format!("Unable to create normalized audio directory: {e}"))?;
     fs::create_dir_all(&metadata_dir)
         .map_err(|e| format!("Unable to create metadata directory: {e}"))?;
+    fs::create_dir_all(&recording_temp_dir)
+        .map_err(|e| format!("Unable to create recording temp directory: {e}"))?;
 
     let mut persisted = if store_path.exists() {
         let content = fs::read_to_string(&store_path)
@@ -2491,7 +2607,9 @@ fn build_shared_state(app: &tauri::App) -> Result<AppShared, String> {
             store_path,
             normalized_dir,
             metadata_dir,
+            recording_temp_dir,
             script_path,
+            recording: recording::RecordingManager::new(),
             worker: Mutex::new(WorkerState {
                 persisted,
                 worker_running: false,
@@ -2527,6 +2645,10 @@ fn migrate_persisted_state(persisted: &mut PersistedState) {
             }
         }
         persisted.schema_version = 4;
+    }
+
+    if persisted.schema_version < 5 {
+        persisted.schema_version = 5;
     }
 
     if persisted.schema_version < STATE_SCHEMA_VERSION {
@@ -2732,12 +2854,18 @@ pub fn run() {
             get_state,
             update_settings,
             enqueue_job,
+            queue_ready_job,
+            get_recording_state,
+            start_recording,
+            stop_recording,
+            cancel_recording,
             retry_job,
             re_transcribe,
             cancel_job,
             pause_job,
             resume_job,
             delete_job,
+            clear_jobs,
             get_transcript_speakers,
             update_speaker_aliases,
             read_transcript,

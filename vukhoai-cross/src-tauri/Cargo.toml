@@ -27,3 +27,6 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "6"
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.23"
