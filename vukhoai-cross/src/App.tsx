@@ -84,12 +84,25 @@ interface RecordingState {
   microphone_device?: string | null;
 }
 
+interface RecordingDevice {
+  id: string;
+  name: string;
+  is_default: boolean;
+}
+
+interface RecordingDevices {
+  system_devices: RecordingDevice[];
+  microphone_devices: RecordingDevice[];
+}
+
 type ListFilter = "all" | "completed_only";
 type RuntimeTone = "gpu" | "cpu" | "detecting";
 
 const JOBS_EVENT = "vukhoai://jobs-updated";
 const SETTINGS_EVENT = "vukhoai://settings-updated";
 const THEME_STORAGE_KEY = "vukhoai.theme_mode";
+const RECORDING_SYSTEM_DEVICE_KEY = "vukhoai.recording.system_device_id";
+const RECORDING_MICROPHONE_DEVICE_KEY = "vukhoai.recording.microphone_device_id";
 
 const profileLabels: Record<Profile, string> = {
   maximum_quality: "Maximum Quality",
@@ -108,6 +121,26 @@ function resolveInitialThemeMode(): ThemeMode {
     return stored === "light" ? "light" : "dark";
   } catch {
     return "dark";
+  }
+}
+
+function readStoredValue(key: string): string {
+  try {
+    return window.localStorage.getItem(key) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeStoredValue(key: string, value: string) {
+  try {
+    if (value) {
+      window.localStorage.setItem(key, value);
+    } else {
+      window.localStorage.removeItem(key);
+    }
+  } catch {
+    // Ignore storage failures; the current in-memory selection still applies.
   }
 }
 
@@ -133,6 +166,16 @@ function App() {
   const [dragActive, setDragActive] = useState(false);
   const [recordingTitle, setRecordingTitle] = useState("");
   const [recordingState, setRecordingState] = useState<RecordingState>({ active: false });
+  const [recordingDevices, setRecordingDevices] = useState<RecordingDevices>({
+    system_devices: [],
+    microphone_devices: [],
+  });
+  const [selectedSystemDeviceId, setSelectedSystemDeviceId] = useState(() =>
+    readStoredValue(RECORDING_SYSTEM_DEVICE_KEY),
+  );
+  const [selectedMicrophoneDeviceId, setSelectedMicrophoneDeviceId] = useState(() =>
+    readStoredValue(RECORDING_MICROPHONE_DEVICE_KEY),
+  );
   const [recordingBusy, setRecordingBusy] = useState(false);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -186,6 +229,15 @@ function App() {
     return recordingState.elapsed_seconds ?? 0;
   }, [recordingState, liveTick]);
 
+  const defaultSystemDevice = useMemo(
+    () => recordingDevices.system_devices.find((device) => device.is_default) ?? null,
+    [recordingDevices.system_devices],
+  );
+  const defaultMicrophoneDevice = useMemo(
+    () => recordingDevices.microphone_devices.find((device) => device.is_default) ?? null,
+    [recordingDevices.microphone_devices],
+  );
+
   const loadInitialState = useCallback(async () => {
     const snapshot = await invoke<AppSnapshot>("get_state");
     setJobs(snapshot.jobs);
@@ -233,6 +285,7 @@ function App() {
   useEffect(() => {
     void loadInitialState();
     void refreshRecordingState();
+    void refreshRecordingDevices();
 
     const interval = setInterval(() => {
       setLiveTick(Date.now());
@@ -265,6 +318,15 @@ function App() {
       setRecordingState(state);
     } catch {
       setRecordingState({ active: false });
+    }
+  }
+
+  async function refreshRecordingDevices() {
+    try {
+      const devices = await invoke<RecordingDevices>("get_recording_devices");
+      setRecordingDevices(devices);
+    } catch {
+      setRecordingDevices({ system_devices: [], microphone_devices: [] });
     }
   }
 
@@ -462,6 +524,16 @@ function App() {
     }
   }
 
+  function chooseSystemDevice(deviceId: string) {
+    setSelectedSystemDeviceId(deviceId);
+    writeStoredValue(RECORDING_SYSTEM_DEVICE_KEY, deviceId);
+  }
+
+  function chooseMicrophoneDevice(deviceId: string) {
+    setSelectedMicrophoneDeviceId(deviceId);
+    writeStoredValue(RECORDING_MICROPHONE_DEVICE_KEY, deviceId);
+  }
+
   async function startRecording() {
     if (recordingBusy || recordingState.active) {
       return;
@@ -472,6 +544,8 @@ function App() {
     try {
       const state = await invoke<RecordingState>("start_recording", {
         title: recordingTitle,
+        systemDeviceId: selectedSystemDeviceId || null,
+        microphoneDeviceId: selectedMicrophoneDeviceId || null,
       });
       setRecordingState(state);
     } catch (error) {
@@ -847,6 +921,46 @@ function App() {
               </>
             )}
           </div>
+        </div>
+
+        <div className="record-device-selectors">
+          <label className="record-device-field">
+            <span>System audio</span>
+            <select
+              value={selectedSystemDeviceId}
+              disabled={recordingState.active || recordingBusy}
+              onChange={(event) => chooseSystemDevice(event.target.value)}
+            >
+              <option value="">
+                Default output{defaultSystemDevice ? ` (${defaultSystemDevice.name})` : ""}
+              </option>
+              {recordingDevices.system_devices.map((device) => (
+                <option key={device.id} value={device.id}>
+                  {device.name}{device.is_default ? " (default)" : ""}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="record-device-field">
+            <span>Microphone</span>
+            <select
+              value={selectedMicrophoneDeviceId}
+              disabled={recordingState.active || recordingBusy}
+              onChange={(event) => chooseMicrophoneDevice(event.target.value)}
+            >
+              <option value="">
+                Default microphone{defaultMicrophoneDevice ? ` (${defaultMicrophoneDevice.name})` : ""}
+              </option>
+              {recordingDevices.microphone_devices.map((device) => (
+                <option key={device.id} value={device.id}>
+                  {device.name}{device.is_default ? " (default)" : ""}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button onClick={refreshRecordingDevices} disabled={recordingState.active || recordingBusy}>
+            Refresh devices
+          </button>
         </div>
 
         <div className="record-devices">

@@ -332,6 +332,26 @@ select:disabled {
   justify-content: flex-end;
 }
 
+.record-device-selectors {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.record-device-field {
+  display: grid;
+  gap: 6px;
+}
+
+.record-device-field span {
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
 .record-devices {
   display: flex;
   flex-wrap: wrap;
@@ -1168,7 +1188,8 @@ progress::-moz-progress-bar {
   }
 
   .record-header,
-  .record-controls {
+  .record-controls,
+  .record-device-selectors {
     grid-template-columns: 1fr;
   }
 

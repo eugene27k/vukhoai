@@ -638,9 +638,16 @@ fn get_recording_state(state: State<'_, AppShared>) -> recording::RecordingSnaps
 }
 
 #[tauri::command]
+fn get_recording_devices() -> Result<recording::RecordingDevices, String> {
+    recording::list_devices()
+}
+
+#[tauri::command]
 fn start_recording(
     state: State<'_, AppShared>,
     title: String,
+    system_device_id: Option<String>,
+    microphone_device_id: Option<String>,
 ) -> Result<recording::RecordingSnapshot, String> {
     let output_folder_path = {
         let guard = state
@@ -652,10 +659,13 @@ fn start_recording(
     };
     let recordings_dir = Path::new(&output_folder_path).join("Recordings");
 
-    state
-        .core
-        .recording
-        .start(&title, &recordings_dir, &state.core.recording_temp_dir)
+    state.core.recording.start(
+        &title,
+        &recordings_dir,
+        &state.core.recording_temp_dir,
+        system_device_id,
+        microphone_device_id,
+    )
 }
 
 #[tauri::command]
@@ -2856,6 +2866,7 @@ pub fn run() {
             enqueue_job,
             queue_ready_job,
             get_recording_state,
+            get_recording_devices,
             start_recording,
             stop_recording,
             cancel_recording,

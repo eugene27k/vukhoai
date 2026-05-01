@@ -26,6 +26,19 @@ pub struct RecordingSnapshot {
     pub microphone_device: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordingDevice {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordingDevices {
+    pub system_devices: Vec<RecordingDevice>,
+    pub microphone_devices: Vec<RecordingDevice>,
+}
+
 #[derive(Debug, Clone)]
 pub struct FinishedRecording {
     pub path: PathBuf,
@@ -87,6 +100,8 @@ impl RecordingManager {
         title: &str,
         recordings_dir: &Path,
         temp_root: &Path,
+        system_device_id: Option<String>,
+        microphone_device_id: Option<String>,
     ) -> Result<RecordingSnapshot, String> {
         let mut guard = self
             .active
@@ -102,7 +117,10 @@ impl RecordingManager {
         fs::create_dir_all(temp_root)
             .map_err(|e| format!("Unable to create recording temp folder: {e}"))?;
 
-        let (system_device, microphone_device) = default_device_names()?;
+        let system_device_id = normalize_device_id(system_device_id);
+        let microphone_device_id = normalize_device_id(microphone_device_id);
+        let (system_device, microphone_device) =
+            selected_device_names(system_device_id.clone(), microphone_device_id.clone())?;
         let id = Uuid::new_v4().to_string();
         let started_at = Utc::now();
         let temp_dir = temp_root.join(&id);
@@ -116,13 +134,17 @@ impl RecordingManager {
         let (startup_tx, startup_rx) = mpsc::channel::<Result<(), String>>();
 
         let system_handle = spawn_capture_thread(
-            CaptureKind::SystemLoopback,
+            CaptureKind::SystemLoopback {
+                device_id: system_device_id,
+            },
             system_raw_path.clone(),
             stop_flag.clone(),
             startup_tx.clone(),
         );
         let microphone_handle = spawn_capture_thread(
-            CaptureKind::Microphone,
+            CaptureKind::Microphone {
+                device_id: microphone_device_id,
+            },
             microphone_raw_path.clone(),
             stop_flag.clone(),
             startup_tx,
@@ -222,10 +244,10 @@ impl RecordingManager {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum CaptureKind {
-    SystemLoopback,
-    Microphone,
+    SystemLoopback { device_id: Option<String> },
+    Microphone { device_id: Option<String> },
 }
 
 fn inactive_snapshot() -> RecordingSnapshot {
@@ -390,33 +412,167 @@ fn add_raw_input(command: &mut Command, path: &Path) {
         .arg(path);
 }
 
+fn normalize_device_id(device_id: Option<String>) -> Option<String> {
+    device_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 #[cfg(windows)]
-fn default_device_names() -> Result<(String, String), String> {
+pub fn list_devices() -> Result<RecordingDevices, String> {
+    run_wasapi_on_thread("vukhoai-audio-device-list", list_devices_inner)
+}
+
+#[cfg(not(windows))]
+pub fn list_devices() -> Result<RecordingDevices, String> {
+    Err("Recording is currently implemented for Windows only.".to_string())
+}
+
+#[cfg(windows)]
+fn selected_device_names(
+    system_device_id: Option<String>,
+    microphone_device_id: Option<String>,
+) -> Result<(String, String), String> {
+    run_wasapi_on_thread("vukhoai-audio-device-probe", move || {
+        selected_device_names_inner(system_device_id.as_deref(), microphone_device_id.as_deref())
+    })
+}
+
+#[cfg(not(windows))]
+fn selected_device_names(
+    _system_device_id: Option<String>,
+    _microphone_device_id: Option<String>,
+) -> Result<(String, String), String> {
+    Err("Recording is currently implemented for Windows only.".to_string())
+}
+
+#[cfg(windows)]
+fn run_wasapi_on_thread<T, F>(thread_name: &'static str, callback: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    thread::Builder::new()
+        .name(thread_name.to_string())
+        .spawn(move || {
+            wasapi::initialize_mta()
+                .ok()
+                .map_err(|e| format!("Unable to initialize Windows audio services: {e}"))?;
+            let result = callback();
+            wasapi::deinitialize();
+            result
+        })
+        .map_err(|e| format!("Unable to start Windows audio worker: {e}"))?
+        .join()
+        .map_err(|_| "Windows audio worker crashed.".to_string())?
+}
+
+#[cfg(windows)]
+fn list_devices_inner() -> Result<RecordingDevices, String> {
     use wasapi::{DeviceEnumerator, Direction};
 
-    wasapi::initialize_mta()
-        .ok()
-        .map_err(|e| format!("Unable to initialize Windows audio services: {e}"))?;
     let enumerator =
         DeviceEnumerator::new().map_err(|e| format!("Unable to enumerate audio devices: {e}"))?;
-    let system_device = enumerator
-        .get_default_device(&Direction::Render)
-        .map_err(|e| format!("Unable to find default system audio device: {e}"))?
-        .get_friendlyname()
-        .map_err(|e| format!("Unable to read system audio device name: {e}"))?;
-    let microphone_device = enumerator
-        .get_default_device(&Direction::Capture)
-        .map_err(|e| format!("Unable to find default microphone: {e}"))?
-        .get_friendlyname()
-        .map_err(|e| format!("Unable to read microphone name: {e}"))?;
-    wasapi::deinitialize();
+    Ok(RecordingDevices {
+        system_devices: collect_devices(&enumerator, Direction::Render, "system audio output")?,
+        microphone_devices: collect_devices(&enumerator, Direction::Capture, "microphone")?,
+    })
+}
+
+#[cfg(windows)]
+fn selected_device_names_inner(
+    system_device_id: Option<&str>,
+    microphone_device_id: Option<&str>,
+) -> Result<(String, String), String> {
+    use wasapi::{DeviceEnumerator, Direction};
+
+    let enumerator =
+        DeviceEnumerator::new().map_err(|e| format!("Unable to enumerate audio devices: {e}"))?;
+    let system_device = resolve_device(
+        &enumerator,
+        Direction::Render,
+        system_device_id,
+        "system audio output",
+    )?
+    .get_friendlyname()
+    .map_err(|e| format!("Unable to read system audio device name: {e}"))?;
+    let microphone_device = resolve_device(
+        &enumerator,
+        Direction::Capture,
+        microphone_device_id,
+        "microphone",
+    )?
+    .get_friendlyname()
+    .map_err(|e| format!("Unable to read microphone name: {e}"))?;
 
     Ok((system_device, microphone_device))
 }
 
-#[cfg(not(windows))]
-fn default_device_names() -> Result<(String, String), String> {
-    Err("Recording is currently implemented for Windows only.".to_string())
+#[cfg(windows)]
+fn collect_devices(
+    enumerator: &wasapi::DeviceEnumerator,
+    direction: wasapi::Direction,
+    label: &str,
+) -> Result<Vec<RecordingDevice>, String> {
+    let default_device_id = enumerator
+        .get_default_device(&direction)
+        .and_then(|device| device.get_id())
+        .ok();
+    let collection = enumerator
+        .get_device_collection(&direction)
+        .map_err(|e| format!("Unable to enumerate {label} devices: {e}"))?;
+    let count = collection
+        .get_nbr_devices()
+        .map_err(|e| format!("Unable to count {label} devices: {e}"))?;
+    let mut devices = Vec::with_capacity(count as usize);
+
+    for index in 0..count {
+        let device = collection
+            .get_device_at_index(index)
+            .map_err(|e| format!("Unable to read {label} device: {e}"))?;
+        let id = device
+            .get_id()
+            .map_err(|e| format!("Unable to read {label} device id: {e}"))?;
+        let name = device
+            .get_friendlyname()
+            .map_err(|e| format!("Unable to read {label} device name: {e}"))?;
+        devices.push(RecordingDevice {
+            is_default: default_device_id.as_deref() == Some(id.as_str()),
+            id,
+            name,
+        });
+    }
+
+    devices.sort_by(|a, b| {
+        b.is_default
+            .cmp(&a.is_default)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(devices)
+}
+
+#[cfg(windows)]
+fn resolve_device(
+    enumerator: &wasapi::DeviceEnumerator,
+    direction: wasapi::Direction,
+    device_id: Option<&str>,
+    label: &str,
+) -> Result<wasapi::Device, String> {
+    if let Some(device_id) = device_id {
+        let device = enumerator
+            .get_device(device_id)
+            .map_err(|e| format!("Unable to open selected {label}: {e}"))?;
+        if device.get_direction() != direction {
+            return Err(format!(
+                "The selected {label} is no longer available as a {label} device."
+            ));
+        }
+        return Ok(device);
+    }
+
+    enumerator
+        .get_default_device(&direction)
+        .map_err(|e| format!("Unable to open default {label}: {e}"))
 }
 
 fn spawn_capture_thread(
@@ -458,18 +614,17 @@ fn capture_raw(
     let result = (|| -> Result<CaptureSummary, String> {
         let enumerator = DeviceEnumerator::new()
             .map_err(|e| format!("Unable to enumerate audio devices: {e}"))?;
-        let device_direction = match kind {
-            CaptureKind::SystemLoopback => Direction::Render,
-            CaptureKind::Microphone => Direction::Capture,
+        let (device_direction, device_id, device_label) = match &kind {
+            CaptureKind::SystemLoopback { device_id } => (
+                Direction::Render,
+                device_id.as_deref(),
+                "system audio output",
+            ),
+            CaptureKind::Microphone { device_id } => {
+                (Direction::Capture, device_id.as_deref(), "microphone")
+            }
         };
-        let device = enumerator
-            .get_default_device(&device_direction)
-            .map_err(|e| match kind {
-                CaptureKind::SystemLoopback => {
-                    format!("Unable to open default system audio device: {e}")
-                }
-                CaptureKind::Microphone => format!("Unable to open default microphone: {e}"),
-            })?;
+        let device = resolve_device(&enumerator, device_direction, device_id, device_label)?;
         let mut audio_client = device
             .get_iaudioclient()
             .map_err(|e| format!("Unable to create audio client: {e}"))?;
