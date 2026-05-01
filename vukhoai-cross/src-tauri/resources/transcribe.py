@@ -20,6 +20,10 @@ PROFILE_TO_MODEL = {
 EXPECTED_AUTO_LANGUAGES = {"uk"}
 UKRAINIAN_LANGUAGE = "uk"
 
+# Some Windows GPU backends can crash during native C++/CUDA teardown after
+# transcription has already succeeded. Keep models alive until process exit.
+_NATIVE_RUNTIME_KEEPALIVE: List[Any] = []
+
 
 @dataclass
 class Segment:
@@ -280,10 +284,22 @@ def clear_silero_vad_cache() -> None:
                 pass
 
 
+def mandatory_diarization_error(exc: Exception, hf_token: Optional[str]) -> str:
+    message = f"{type(exc).__name__}: {exc}"
+    if not hf_token:
+        message += " Configure HF token if pyannote models are not already cached."
+    return message
+
+
 def resolve_faster_whisper_runtime(profile: str) -> FasterWhisperRuntime:
     try:
         import ctranslate2  # type: ignore
     except Exception as exc:
+        emit_diagnostic(
+            "preflight",
+            "faster-whisper GPU preflight failed because CTranslate2 could not be imported. "
+            f"{type(exc).__name__}: {exc}",
+        )
         return FasterWhisperRuntime(
             device="cpu",
             compute_type="int8",
@@ -302,6 +318,10 @@ def resolve_faster_whisper_runtime(profile: str) -> FasterWhisperRuntime:
         cuda_count = 0
 
     if cuda_count <= 0:
+        emit_diagnostic(
+            "preflight",
+            "faster-whisper GPU preflight did not detect a CUDA device in the selected runtime.",
+        )
         return FasterWhisperRuntime(
             device="cpu",
             compute_type="int8",
@@ -317,6 +337,13 @@ def resolve_faster_whisper_runtime(profile: str) -> FasterWhisperRuntime:
         supported_compute_types = set(ctranslate2.get_supported_compute_types("cuda", 0))
     except Exception:
         supported_compute_types = set()
+
+    emit_diagnostic(
+        "preflight",
+        "faster-whisper GPU preflight: "
+        f"cuda_devices={cuda_count}, supported_compute_types="
+        f"{', '.join(sorted(supported_compute_types)) if supported_compute_types else 'none'}.",
+    )
 
     if not supported_compute_types:
         return FasterWhisperRuntime(
@@ -353,6 +380,94 @@ def resolve_faster_whisper_runtime(profile: str) -> FasterWhisperRuntime:
         gpu_active=True,
         notice=f"Using NVIDIA CUDA acceleration for faster-whisper ({compute_type}).",
     )
+
+
+def resolve_whisperx_runtime() -> Tuple[str, str]:
+    import torch  # type: ignore
+
+    cuda_available = False
+    device_count = 0
+    device_name: Optional[str] = None
+    supported_compute_types: set[str] = set()
+
+    try:
+        cuda_available = bool(torch.cuda.is_available())
+    except Exception as exc:
+        message = (
+            "WhisperX GPU preflight failed while checking PyTorch CUDA availability. "
+            f"{type(exc).__name__}: {exc}"
+        )
+        emit_diagnostic("preflight", message)
+        raise RuntimeError(message) from exc
+
+    try:
+        device_count = int(torch.cuda.device_count())
+    except Exception:
+        device_count = 0
+
+    if not cuda_available or device_count <= 0:
+        message = (
+            "WhisperX GPU preflight failed: PyTorch CUDA is not available in the selected runtime, "
+            "so WhisperX is not allowed to fall back to CPU."
+        )
+        emit_diagnostic(
+            "preflight",
+            f"WhisperX GPU preflight: cuda_available={cuda_available}, cuda_devices={device_count}.",
+        )
+        raise RuntimeError(message)
+
+    try:
+        torch.cuda.init()
+        device_name = torch.cuda.get_device_name(0)
+        probe_tensor = torch.zeros(1, device="cuda:0")
+        _ = probe_tensor + 1
+        torch.cuda.synchronize(0)
+    except Exception as exc:
+        message = (
+            "WhisperX GPU preflight detected CUDA, but the selected runtime could not initialize "
+            f"the GPU successfully. {type(exc).__name__}: {exc}"
+        )
+        emit_diagnostic(
+            "preflight",
+            f"WhisperX GPU preflight failed after CUDA detection on device 0. {type(exc).__name__}: {exc}",
+        )
+        raise RuntimeError(message) from exc
+
+    try:
+        import ctranslate2  # type: ignore
+
+        supported_compute_types = set(ctranslate2.get_supported_compute_types("cuda", 0))
+    except Exception as exc:
+        emit_diagnostic(
+            "preflight",
+            "WhisperX compute-type probe could not query CTranslate2 supported CUDA types. "
+            f"{type(exc).__name__}: {exc}",
+        )
+
+    compute_type = "float16"
+    if supported_compute_types:
+        preferred_compute_types = ["float16", "int8_float16", "int8", "float32", "int8_float32"]
+        compute_type = next((item for item in preferred_compute_types if item in supported_compute_types), "")
+        if not compute_type:
+            message = (
+                "WhisperX GPU preflight found a CUDA device, but CTranslate2 did not report a compatible "
+                "compute type for the selected runtime."
+            )
+            emit_diagnostic(
+                "preflight",
+                "WhisperX compute-type probe reported supported types="
+                f"{', '.join(sorted(supported_compute_types))}.",
+            )
+            raise RuntimeError(message)
+
+    emit_diagnostic(
+        "preflight",
+        "WhisperX GPU preflight succeeded: "
+        f"cuda_devices={device_count}, device_name={device_name or 'unknown'}, "
+        f"compute_type={compute_type}, supported_compute_types="
+        f"{', '.join(sorted(supported_compute_types)) if supported_compute_types else 'unknown'}.",
+    )
+    return "cuda", compute_type
 
 
 def normalize_segments(
@@ -424,25 +539,41 @@ def transcribe_with_whisperx(
     diarization_enabled: bool,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     import whisperx  # type: ignore
-    import torch  # type: ignore
 
-    emit_progress(10, "Loading WhisperX model")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    compute_type = "float16" if device == "cuda" else "int8"
-    runtime_fallback_reason = None
-    if device != "cuda":
-        runtime_fallback_reason = (
-            "PyTorch CUDA is not available to the selected WhisperX runtime. "
-            "Transcription is running on CPU."
-        )
+    if not diarization_enabled:
+        raise RuntimeError("Diarization is mandatory for Vukho.AI jobs.")
+
+    emit_progress(6, "Checking GPU runtime")
+    device, compute_type = resolve_whisperx_runtime()
     emit_runtime_state(
         engine="whisperx",
         device=device,
         compute_type=compute_type,
-        gpu_active=device == "cuda",
-        fallback_reason=runtime_fallback_reason,
+        gpu_active=True,
+        fallback_reason=None,
     )
 
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    try:
+        from whisperx.diarize import DiarizationPipeline  # type: ignore
+
+        emit_progress(10, "Checking diarization readiness")
+        diarization_ready_started = time.perf_counter()
+        diarization_pipeline = DiarizationPipeline(
+            token=hf_token,
+            device=device,
+        )
+        emit_diagnostic(
+            "phase",
+            "Diarization pipeline initialized in "
+            f"{format_timestamp(time.perf_counter() - diarization_ready_started)}.",
+        )
+    except Exception as exc:
+        message = "Diarization preflight failed. " + mandatory_diarization_error(exc, hf_token)
+        emit_diagnostic("preflight", message)
+        raise RuntimeError(message) from exc
+
+    emit_progress(14, "Loading WhisperX model")
     model_load_started = time.perf_counter()
     model = whisperx.load_model(
         model_name,
@@ -450,6 +581,7 @@ def transcribe_with_whisperx(
         compute_type=compute_type,
         vad_method="silero",
     )
+    _NATIVE_RUNTIME_KEEPALIVE.append(model)
     emit_diagnostic(
         "phase",
         f"WhisperX model loaded in {format_timestamp(time.perf_counter() - model_load_started)}.",
@@ -490,8 +622,6 @@ def transcribe_with_whisperx(
     alignment_applied = False
     alignment_error: Optional[str] = None
     result_for_speakers: Dict[str, Any] = result
-    diarization_pipeline: Optional[Any] = None
-
     if detected_language and segments:
         try:
             emit_progress(55, "Aligning timestamps")
@@ -518,51 +648,27 @@ def transcribe_with_whisperx(
     diarization_applied = False
     diarization_error: Optional[str] = None
 
-    if diarization_enabled:
-        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-        try:
-            from whisperx.diarize import DiarizationPipeline  # type: ignore
-
-            emit_progress(68, "Checking diarization readiness")
-            diarization_ready_started = time.perf_counter()
-            diarization_pipeline = DiarizationPipeline(
-                token=hf_token,
-                device=device,
-            )
-            emit_diagnostic(
-                "phase",
-                "Diarization pipeline initialized in "
-                f"{format_timestamp(time.perf_counter() - diarization_ready_started)}.",
-            )
-        except Exception as exc:  # pragma: no cover - fallback path
-            diarization_error = f"{type(exc).__name__}: {exc}"
-            if not hf_token:
-                diarization_error += " Configure HF token if pyannote models are not already cached."
-            emit_notice(f"Diarization preflight failed. {diarization_error}")
-
-    if diarization_enabled and diarization_pipeline is not None:
-        try:
-            emit_progress(82, "Applying diarization")
-            diarization_started = time.perf_counter()
-            diarized = diarization_pipeline(audio_path)
-            assigned = whisperx.assign_word_speakers(diarized, result_for_speakers)
-            segments = assigned.get("segments", segments)
-            diarization_applied = True
-            emit_diagnostic(
-                "phase",
-                f"Diarization finished in {format_timestamp(time.perf_counter() - diarization_started)}.",
-            )
-        except Exception as exc:  # pragma: no cover - fallback path
-            diarization_error = f"{type(exc).__name__}: {exc}"
-            if not hf_token:
-                diarization_error += " Configure HF token if pyannote models are not already cached."
+    try:
+        emit_progress(82, "Applying diarization")
+        diarization_started = time.perf_counter()
+        diarized = diarization_pipeline(audio_path)
+        assigned = whisperx.assign_word_speakers(diarized, result_for_speakers)
+        segments = assigned.get("segments", segments)
+        diarization_applied = True
+        emit_diagnostic(
+            "phase",
+            f"Diarization finished in {format_timestamp(time.perf_counter() - diarization_started)}.",
+        )
+    except Exception as exc:
+        diarization_error = mandatory_diarization_error(exc, hf_token)
+        raise RuntimeError("Diarization failed. " + diarization_error) from exc
 
     meta = {
         "engine": "whisperx",
         "runtime_device": device,
         "runtime_compute_type": compute_type,
-        "runtime_gpu_active": device == "cuda",
-        "runtime_fallback_reason": runtime_fallback_reason,
+        "runtime_gpu_active": True,
+        "runtime_fallback_reason": None,
         "detected_language": detected_language,
         "language_retry_reason": language_retry_reason,
         "alignment_applied": alignment_applied,
@@ -571,6 +677,43 @@ def transcribe_with_whisperx(
         "diarization_error": diarization_error,
     }
     return segments, meta
+
+
+def run_mandatory_preflight() -> int:
+    if importlib.util.find_spec("whisperx") is None:
+        print("Mandatory diarization runtime is not installed: whisperx is missing.", file=sys.stderr)
+        return 3
+
+    emit_progress(2, "Checking mandatory runtime")
+    device, compute_type = resolve_whisperx_runtime()
+    emit_runtime_state(
+        engine="whisperx",
+        device=device,
+        compute_type=compute_type,
+        gpu_active=True,
+        fallback_reason=None,
+    )
+
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    try:
+        from whisperx.diarize import DiarizationPipeline  # type: ignore
+
+        preflight_started = time.perf_counter()
+        pipeline = DiarizationPipeline(token=hf_token, device=device)
+        _NATIVE_RUNTIME_KEEPALIVE.append(pipeline)
+        emit_diagnostic(
+            "preflight",
+            "Mandatory diarization preflight succeeded: "
+            f"WhisperX CUDA compute_type={compute_type}; pyannote pipeline initialized in "
+            f"{format_timestamp(time.perf_counter() - preflight_started)}.",
+        )
+        emit_progress(100, "Mandatory runtime ready", 0)
+        return 0
+    except Exception as exc:
+        message = "Diarization preflight failed. " + mandatory_diarization_error(exc, hf_token)
+        emit_diagnostic("preflight", message)
+        print(message, file=sys.stderr)
+        return 3
 
 
 def transcribe_with_faster_whisper(
@@ -598,6 +741,7 @@ def transcribe_with_faster_whisper(
     emit_progress(10, "Loading model")
     model_load_started = time.perf_counter()
     model = WhisperModel(model_name, device=runtime.device, compute_type=runtime.compute_type)
+    _NATIVE_RUNTIME_KEEPALIVE.append(model)
     emit_diagnostic(
         "phase",
         f"faster-whisper model loaded in {format_timestamp(time.perf_counter() - model_load_started)}.",
@@ -688,26 +832,42 @@ def transcribe_with_faster_whisper(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Vukho.AI local transcription pipeline")
-    parser.add_argument("--input", required=True, help="Path to input audio file")
-    parser.add_argument("--output", required=True, help="Path to output TXT file")
-    parser.add_argument("--meta", required=True, help="Path to metadata JSON file")
+    parser.add_argument("--input", help="Path to input audio file")
+    parser.add_argument("--output", help="Path to output TXT file")
+    parser.add_argument("--meta", help="Path to metadata JSON file")
     parser.add_argument("--profile", choices=["max", "balanced", "fast"], default="max")
     parser.add_argument("--language", choices=["auto", "uk"], default="auto")
     parser.add_argument("--diarization", choices=["on", "off"], default="on")
     parser.add_argument("--duration-seconds", type=float, default=0.0)
+    parser.add_argument("--preflight-only", action="store_true")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
 
-    if not os.path.exists(args.input):
-        print(f"Input file not found: {args.input}", file=sys.stderr)
-        return 2
-
     model_name = PROFILE_TO_MODEL[args.profile]
     diarization_requested = args.diarization == "on"
     total_duration_seconds = args.duration_seconds if args.duration_seconds > 0 else None
+
+    if args.preflight_only:
+        if not diarization_requested:
+            print("Diarization is mandatory for Vukho.AI jobs. Refusing transcription-only preflight.", file=sys.stderr)
+            return 2
+        return run_mandatory_preflight()
+
+    missing_args = [
+        flag
+        for flag, value in (("--input", args.input), ("--output", args.output), ("--meta", args.meta))
+        if not value
+    ]
+    if missing_args:
+        print(f"Missing required arguments for processing: {', '.join(missing_args)}", file=sys.stderr)
+        return 2
+
+    if not os.path.exists(args.input):
+        print(f"Input file not found: {args.input}", file=sys.stderr)
+        return 2
 
     output_dir = os.path.dirname(args.output)
     meta_dir = os.path.dirname(args.meta)
@@ -720,100 +880,69 @@ def main() -> int:
     engine_meta: Dict[str, Any]
     fallback_events: List[str] = []
     whisperx_succeeded = False
-    upstream_fallback_reason: Optional[str] = None
 
     emit_progress(2, "Initializing")
 
+    if not diarization_requested:
+        print("Diarization is mandatory for Vukho.AI jobs. Refusing transcription-only processing.", file=sys.stderr)
+        return 2
+
     whisperx_installed = importlib.util.find_spec("whisperx") is not None
-
-    if whisperx_installed:
-        try:
-            raw_segments, engine_meta = transcribe_with_whisperx(
-                audio_path=args.input,
-                model_name=model_name,
-                language_mode=args.language,
-                diarization_enabled=diarization_requested,
-            )
-            whisperx_succeeded = True
-        except Exception as whisperx_error:
-            fallback_events.append(f"whisperx unavailable: {type(whisperx_error).__name__}: {whisperx_error}")
-            if should_retry_whisperx(whisperx_error):
-                emit_notice("WhisperX cache looks corrupted. Retrying once after clearing cached Silero VAD files.")
-                clear_silero_vad_cache()
-                try:
-                    raw_segments, engine_meta = transcribe_with_whisperx(
-                        audio_path=args.input,
-                        model_name=model_name,
-                        language_mode=args.language,
-                        diarization_enabled=diarization_requested,
-                    )
-                    whisperx_succeeded = True
-                except Exception as retry_error:
-                    whisperx_error = retry_error
-                    fallback_events.append(
-                        f"whisperx unavailable after retry: {type(retry_error).__name__}: {retry_error}"
-                    )
-
-            if not whisperx_succeeded:
-                upstream_fallback_reason = (
-                    f"WhisperX failed ({type(whisperx_error).__name__}: {whisperx_error}). "
-                    "Falling back to faster-whisper, so diarization will be skipped."
-                )
-                emit_notice(
-                    "WhisperX is unavailable for this run. Falling back to faster-whisper, so diarization will be skipped."
-                )
-                emit_progress(6, "Falling back to faster-whisper")
-                try:
-                    raw_segments, engine_meta = transcribe_with_faster_whisper(
-                        audio_path=args.input,
-                        model_name=model_name,
-                        language_mode=args.language,
-                        total_duration_seconds=total_duration_seconds,
-                        profile=args.profile,
-                        upstream_fallback_reason=upstream_fallback_reason,
-                    )
-                except Exception as fallback_error:
-                    print("Transcription failed in both whisperx and faster-whisper.", file=sys.stderr)
-                    print(f"whisperx error: {whisperx_error}", file=sys.stderr)
-                    print(f"faster-whisper error: {fallback_error}", file=sys.stderr)
-                    return 3
-    else:
-        fallback_events.append("whisperx unavailable: module not installed")
-        upstream_fallback_reason = (
-            "WhisperX is not installed in the selected diarization Python. "
-            "Falling back to faster-whisper without diarization."
+    if not whisperx_installed:
+        print(
+            "Mandatory diarization runtime is not installed: whisperx is missing. "
+            "Refusing transcription-only processing.",
+            file=sys.stderr,
         )
-        emit_notice(
-            "WhisperX is not installed in the selected diarization Python. Falling back to faster-whisper without diarization."
+        return 3
+
+    try:
+        raw_segments, engine_meta = transcribe_with_whisperx(
+            audio_path=args.input,
+            model_name=model_name,
+            language_mode=args.language,
+            diarization_enabled=True,
         )
-        try:
-            raw_segments, engine_meta = transcribe_with_faster_whisper(
-                audio_path=args.input,
-                model_name=model_name,
-                language_mode=args.language,
-                total_duration_seconds=total_duration_seconds,
-                profile=args.profile,
-                upstream_fallback_reason=upstream_fallback_reason,
-            )
-        except Exception as fallback_error:
-            print("Transcription failed in faster-whisper.", file=sys.stderr)
-            print(f"faster-whisper error: {fallback_error}", file=sys.stderr)
+        whisperx_succeeded = True
+    except Exception as whisperx_error:
+        fallback_events.append(f"whisperx unavailable: {type(whisperx_error).__name__}: {whisperx_error}")
+        if should_retry_whisperx(whisperx_error):
+            emit_notice("WhisperX cache looks corrupted. Retrying once after clearing cached Silero VAD files.")
+            clear_silero_vad_cache()
+            try:
+                raw_segments, engine_meta = transcribe_with_whisperx(
+                    audio_path=args.input,
+                    model_name=model_name,
+                    language_mode=args.language,
+                    diarization_enabled=True,
+                )
+                whisperx_succeeded = True
+            except Exception as retry_error:
+                whisperx_error = retry_error
+                fallback_events.append(
+                    f"whisperx unavailable after retry: {type(retry_error).__name__}: {retry_error}"
+                )
+
+        if not whisperx_succeeded:
+            print("Mandatory transcription + diarization failed.", file=sys.stderr)
+            print(f"whisperx error: {whisperx_error}", file=sys.stderr)
             return 3
 
     emit_progress(96, "Finalizing output")
-    diarization_applied = bool(engine_meta.get("diarization_applied")) if diarization_requested else False
+    diarization_applied = bool(engine_meta.get("diarization_applied"))
+    if not diarization_applied:
+        print("Mandatory diarization did not complete. Refusing transcription-only output.", file=sys.stderr)
+        return 3
 
     segments = normalize_segments(
         raw_segments=raw_segments,
-        diarization_requested=diarization_requested,
+        diarization_requested=True,
         diarization_applied=diarization_applied,
     )
 
     write_txt(args.output, segments)
 
     diarization_fallback_reason = None
-    if diarization_requested and not diarization_applied:
-        diarization_fallback_reason = engine_meta.get("diarization_error") or "Diarization failed; fallback to SPEAKER_01."
 
     metadata = {
         "input": args.input,
@@ -823,7 +952,7 @@ def main() -> int:
         "language_mode": args.language,
         "segment_count": len(segments),
         "speaker_count": len({segment.speaker for segment in segments}),
-        "diarization_requested": diarization_requested,
+        "diarization_requested": True,
         "diarization_applied": diarization_applied,
         "diarization_fallback_reason": diarization_fallback_reason,
         "engine": engine_meta.get("engine"),
@@ -852,4 +981,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    exit_code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if os.name == "nt":
+        os._exit(exit_code)
+    sys.exit(exit_code)

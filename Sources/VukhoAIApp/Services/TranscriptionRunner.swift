@@ -58,13 +58,6 @@ enum TranscriptionRunner {
             }
         }
 
-        if let explicit = environment["GHOSTMIC_PYTHON"], !explicit.isEmpty {
-            let url = URL(fileURLWithPath: explicit)
-            if FileManager.default.isExecutableFile(atPath: url.path) {
-                return url
-            }
-        }
-
         let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
         let cwdVenv = cwd.appendingPathComponent(".venv/bin/python3")
         if FileManager.default.isExecutableFile(atPath: cwdVenv.path) {
@@ -363,7 +356,7 @@ final class TranscriptionExecution {
     }
 
     private func parseProgress(from line: String) -> TranscriptionProgressEvent? {
-        let prefixes = ["VUKHOAI_PROGRESS ", "GHOSTMIC_PROGRESS "]
+        let prefixes = ["VUKHOAI_PROGRESS "]
         guard let prefix = prefixes.first(where: { line.hasPrefix($0) }) else { return nil }
 
         let jsonString = String(line.dropFirst(prefix.count))

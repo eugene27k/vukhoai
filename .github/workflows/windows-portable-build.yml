@@ -9,7 +9,7 @@ on:
       - ".github/workflows/windows-portable-build.yml"
       - "Build Windows Portable.cmd"
       - "Scripts/**"
-      - "ghostmic-cross/**"
+      - "vukhoai-cross/**"
 
 jobs:
   build:
@@ -27,7 +27,7 @@ jobs:
         with:
           node-version: "20"
           cache: "npm"
-          cache-dependency-path: ghostmic-cross/package-lock.json
+          cache-dependency-path: vukhoai-cross/package-lock.json
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -37,9 +37,17 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Ensure ffmpeg is available for recording support
+        run: |
+          if (-not (Get-Command ffmpeg.exe -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg -y --no-progress
+          }
+          ffmpeg -version
+          ffprobe -version
+
       - name: Seed portable settings from repository secrets
         run: |
-          $portableDir = Join-Path $PWD "ghostmic-cross\portable-build"
+          $portableDir = Join-Path $PWD "vukhoai-cross\portable-build"
           New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
 
           $settings = @{
@@ -73,5 +81,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Vukho.AI-Windows-Portable
-          path: ghostmic-cross/portable-build/windows/Vukho.AI-Windows-Portable
+          path: vukhoai-cross/portable-build/windows/Vukho.AI-Windows-Portable
           if-no-files-found: error

@@ -13,10 +13,12 @@ use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
-const JOBS_EVENT: &str = "ghostmic://jobs-updated";
-const SETTINGS_EVENT: &str = "ghostmic://settings-updated";
+mod recording;
+
+const JOBS_EVENT: &str = "vukhoai://jobs-updated";
+const SETTINGS_EVENT: &str = "vukhoai://settings-updated";
 const PORTABLE_STATE_FILE_NAME: &str = "portable-state.json";
-const STATE_SCHEMA_VERSION: u32 = 2;
+const STATE_SCHEMA_VERSION: u32 = 5;
 const MAX_PERFORMANCE_LOG_ENTRIES: usize = 80;
 const PERFORMANCE_GAP_WARNING_SECONDS: i64 = 15 * 60;
 const PERFORMANCE_PROGRESS_MILESTONE_STEP: f64 = 25.0;
@@ -38,6 +40,7 @@ fn legacy_state_schema_version() -> u32 {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum JobStatus {
+    Ready,
     Queued,
     Processing,
     Done,
@@ -229,7 +232,9 @@ struct AppCore {
     store_path: PathBuf,
     normalized_dir: PathBuf,
     metadata_dir: PathBuf,
+    recording_temp_dir: PathBuf,
     script_path: PathBuf,
+    recording: recording::RecordingManager,
     worker: Mutex<WorkerState>,
 }
 
@@ -260,6 +265,12 @@ struct DiagnosticPayload {
     message: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum NewJobMode {
+    Ready,
+    Queued,
+}
+
 #[derive(Debug)]
 struct RunResult {
     exit_code: i32,
@@ -277,6 +288,9 @@ struct PythonRuntimeCapabilities {
     has_faster_whisper: bool,
     has_whisperx: bool,
     has_pyannote_audio: bool,
+    torch_cuda_available: bool,
+    torch_cuda_device_count: u32,
+    ctranslate2_cuda_device_count: u32,
 }
 
 impl PythonRuntimeCapabilities {
@@ -285,7 +299,11 @@ impl PythonRuntimeCapabilities {
     }
 
     fn supports_diarization(self) -> bool {
-        self.has_whisperx && self.has_pyannote_audio
+        self.has_whisperx
+            && self.has_pyannote_audio
+            && self.torch_cuda_available
+            && self.torch_cuda_device_count > 0
+            && self.ctranslate2_cuda_device_count > 0
     }
 }
 
@@ -297,6 +315,12 @@ struct PythonRuntimeCapabilitiesJson {
     whisperx: bool,
     #[serde(default)]
     pyannote_audio: bool,
+    #[serde(default)]
+    torch_cuda_available: bool,
+    #[serde(default)]
+    torch_cuda_device_count: u32,
+    #[serde(default)]
+    ctranslate2_cuda_device_count: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -441,7 +465,7 @@ fn update_settings(
     guard.persisted.settings = AppSettings {
         default_profile: payload.default_profile,
         language_mode: payload.language_mode,
-        diarization_enabled: payload.diarization_enabled,
+        diarization_enabled: true,
         output_folder_path: output_path.to_string_lossy().into_owned(),
         python_path: payload
             .python_path
@@ -479,8 +503,7 @@ fn update_settings(
     Ok(updated)
 }
 
-#[tauri::command]
-fn enqueue_job(state: State<'_, AppShared>, input_path: String) -> Result<ImportJob, String> {
+fn validate_import_path(input_path: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(input_path.trim());
     if !path.exists() {
         return Err("Input file does not exist.".to_string());
@@ -495,14 +518,16 @@ fn enqueue_job(state: State<'_, AppShared>, input_path: String) -> Result<Import
         return Err("Unsupported format. Use .m4a or .mp4.".to_string());
     }
 
-    let mut guard = state
-        .core
-        .worker
-        .lock()
-        .map_err(|_| "Failed to lock state".to_string())?;
-    let settings = guard.persisted.settings.clone();
+    Ok(path)
+}
 
-    let job = ImportJob {
+fn build_import_job(
+    path: &Path,
+    settings: &AppSettings,
+    mode: NewJobMode,
+    duration_seconds: Option<f64>,
+) -> ImportJob {
+    ImportJob {
         id: Uuid::new_v4().to_string(),
         input_path: path.to_string_lossy().into_owned(),
         input_filename: path
@@ -511,12 +536,15 @@ fn enqueue_job(state: State<'_, AppShared>, input_path: String) -> Result<Import
             .unwrap_or("input")
             .to_string(),
         normalized_audio_path: None,
-        status: JobStatus::Queued,
+        status: match mode {
+            NewJobMode::Ready => JobStatus::Ready,
+            NewJobMode::Queued => JobStatus::Queued,
+        },
         created_at: Utc::now(),
-        duration_seconds: None,
+        duration_seconds,
         profile: settings.default_profile,
         language_mode: settings.language_mode,
-        diarization_enabled: settings.diarization_enabled,
+        diarization_enabled: true,
         output_txt_path: None,
         meta_json_path: None,
         error_message: None,
@@ -541,17 +569,121 @@ fn enqueue_job(state: State<'_, AppShared>, input_path: String) -> Result<Import
         last_progress_log_at: None,
         last_progress_log_stage: None,
         last_progress_log_percent: None,
-    };
+    }
+}
+
+fn insert_import_job(
+    shared: &AppShared,
+    path: &Path,
+    mode: NewJobMode,
+    duration_seconds: Option<f64>,
+) -> Result<ImportJob, String> {
+    let mut guard = shared
+        .core
+        .worker
+        .lock()
+        .map_err(|_| "Failed to lock state".to_string())?;
+    let settings = guard.persisted.settings.clone();
+
+    let job = build_import_job(path, &settings, mode, duration_seconds);
 
     guard.persisted.jobs.push(job.clone());
     guard.persisted.jobs.sort_by_key(|j| j.created_at);
     drop(guard);
 
+    persist_state(&shared.core)?;
+    emit_full_state(&shared.core);
+
+    Ok(job)
+}
+
+#[tauri::command]
+fn enqueue_job(state: State<'_, AppShared>, input_path: String) -> Result<ImportJob, String> {
+    let path = validate_import_path(&input_path)?;
+    let job = insert_import_job(state.inner(), &path, NewJobMode::Queued, None)?;
+    ensure_worker_running(state.inner().clone());
+    Ok(job)
+}
+
+#[tauri::command]
+fn queue_ready_job(state: State<'_, AppShared>, job_id: String) -> Result<(), String> {
+    let mut guard = state
+        .core
+        .worker
+        .lock()
+        .map_err(|_| "Failed to lock state".to_string())?;
+    let Some(job) = guard.persisted.jobs.iter_mut().find(|j| j.id == job_id) else {
+        return Err("Job not found.".to_string());
+    };
+
+    if job.status != JobStatus::Ready {
+        return Err("Only ready recordings can be queued.".to_string());
+    }
+
+    job.status = JobStatus::Queued;
+    job.error_message = None;
+    job.notice_message = None;
+    job.diarization_enabled = true;
+    drop(guard);
+
     persist_state(&state.core)?;
     emit_full_state(&state.core);
     ensure_worker_running(state.inner().clone());
+    Ok(())
+}
 
+#[tauri::command]
+fn get_recording_state(state: State<'_, AppShared>) -> recording::RecordingSnapshot {
+    state.core.recording.snapshot()
+}
+
+#[tauri::command]
+fn get_recording_devices() -> Result<recording::RecordingDevices, String> {
+    recording::list_devices()
+}
+
+#[tauri::command]
+fn start_recording(
+    state: State<'_, AppShared>,
+    title: String,
+    system_device_id: Option<String>,
+    microphone_device_id: Option<String>,
+) -> Result<recording::RecordingSnapshot, String> {
+    let output_folder_path = {
+        let guard = state
+            .core
+            .worker
+            .lock()
+            .map_err(|_| "Failed to lock state".to_string())?;
+        guard.persisted.settings.output_folder_path.clone()
+    };
+    let recordings_dir = Path::new(&output_folder_path).join("Recordings");
+
+    state.core.recording.start(
+        &title,
+        &recordings_dir,
+        &state.core.recording_temp_dir,
+        system_device_id,
+        microphone_device_id,
+    )
+}
+
+#[tauri::command]
+fn stop_recording(state: State<'_, AppShared>) -> Result<ImportJob, String> {
+    let ffmpeg_binary = resolve_runtime_binary(FFMPEG_BINARY_NAME);
+    let finished = state.core.recording.stop(&ffmpeg_binary)?;
+    let job = insert_import_job(
+        state.inner(),
+        &finished.path,
+        NewJobMode::Ready,
+        finished.duration_seconds,
+    )?;
     Ok(job)
+}
+
+#[tauri::command]
+fn cancel_recording(state: State<'_, AppShared>) -> Result<(), String> {
+    state.core.recording.cancel()
 }
 
 #[tauri::command]
@@ -566,6 +698,7 @@ fn retry_job(state: State<'_, AppShared>, job_id: String) -> Result<(), String> 
     };
 
     job.status = JobStatus::Queued;
+    job.diarization_enabled = true;
     job.error_message = None;
     job.notice_message = None;
     job.runtime_engine = None;
@@ -657,7 +790,7 @@ fn cancel_job(state: State<'_, AppShared>, job_id: String) -> Result<(), String>
             job.last_progress_log_stage = None;
             job.last_progress_log_percent = None;
         }
-        JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled => {}
+        JobStatus::Ready | JobStatus::Done | JobStatus::Failed | JobStatus::Cancelled => {}
     }
 
     drop(guard);
@@ -966,6 +1099,7 @@ fn worker_loop(shared: AppShared) {
 
             if let Some(job) = guard.persisted.jobs.iter_mut().find(|j| j.id == *job_id) {
                 job.status = JobStatus::Processing;
+                job.diarization_enabled = true;
                 job.error_message = None;
                 job.notice_message = None;
                 job.runtime_engine = None;
@@ -979,7 +1113,7 @@ fn worker_loop(shared: AppShared) {
                 job.wall_elapsed_seconds = None;
                 job.audio_to_wall_ratio = None;
                 job.progress_percent = Some(1.0);
-                job.progress_stage = Some("Preparing audio".to_string());
+                job.progress_stage = Some("Checking mandatory runtime".to_string());
                 job.progress_eta_seconds = None;
                 job.processing_started_at = Some(Utc::now());
                 job.is_paused = false;
@@ -1215,9 +1349,87 @@ fn finalize_job_after_run(shared: &AppShared, job_id: &str, run_result: Result<R
     emit_full_state(&shared.core);
 }
 
+fn run_mandatory_runtime_preflight(
+    shared: &AppShared,
+    job_id: &str,
+    settings: &AppSettings,
+    job: &ImportJob,
+    python_binary: &str,
+    output_path: &str,
+    meta_path: &str,
+) -> Result<(), String> {
+    let mut command = Command::new(python_binary);
+    configure_python_command(&mut command, python_binary);
+    command
+        .arg(&shared.core.script_path)
+        .arg("--input")
+        .arg(&job.input_path)
+        .arg("--output")
+        .arg(output_path)
+        .arg("--meta")
+        .arg(meta_path)
+        .arg("--profile")
+        .arg(job.profile.python_flag())
+        .arg("--language")
+        .arg(job.language_mode.python_flag())
+        .arg("--diarization")
+        .arg("on")
+        .arg("--duration-seconds")
+        .arg("0")
+        .arg("--preflight-only");
+
+    if let Some(token) = settings
+        .huggingface_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        command.env("HF_TOKEN", token);
+        command.env("HUGGINGFACE_HUB_TOKEN", token);
+    }
+
+    let output = command
+        .output()
+        .map_err(|e| format!("Unable to start mandatory runtime preflight: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut stdout_non_progress: Vec<String> = Vec::new();
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if !apply_runtime_line(shared, job_id, line) {
+            stdout_non_progress.push(line.to_string());
+        }
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        let combined = format!("{}\n{}", stdout_non_progress.join("\n"), stderr)
+            .trim()
+            .to_string();
+        if combined.is_empty() {
+            return Err(format!(
+                "Mandatory runtime preflight failed with exit code {}.",
+                output.status.code().unwrap_or(-1)
+            ));
+        }
+
+        return Err(combined);
+    }
+
+    let _ = append_performance_log_to_job(
+        shared,
+        job_id,
+        "preflight",
+        "Mandatory runtime preflight passed before audio processing.",
+    );
+    Ok(())
+}
+
 fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
     let run_started = Instant::now();
-    let (settings, job) = {
+    let (settings, mut job) = {
         let guard = shared
             .core
             .worker
@@ -1228,11 +1440,48 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
         };
         (guard.persisted.settings.clone(), job.clone())
     };
+    job.diarization_enabled = true;
 
     fs::create_dir_all(&shared.core.normalized_dir)
         .map_err(|e| format!("Unable to prepare audio cache directory: {e}"))?;
     fs::create_dir_all(&shared.core.metadata_dir)
         .map_err(|e| format!("Unable to prepare metadata directory: {e}"))?;
+
+    let output_path = output_txt_path(&settings, &job);
+    let meta_path = shared
+        .core
+        .metadata_dir
+        .join(format!("{}.json", job.id))
+        .to_string_lossy()
+        .into_owned();
+
+    if let Some(parent) = Path::new(&output_path).parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Unable to prepare output directory: {e}"))?;
+    }
+
+    let python_binary = resolve_python_binary(&settings, &shared.core.script_path, true)?;
+    let _ = append_performance_log_to_job(
+        shared,
+        job_id,
+        "runtime",
+        format!("Selected Python runtime: {python_binary} (mandatory diarization)"),
+    );
+    let _ = append_performance_log_to_job(
+        shared,
+        job_id,
+        "preflight",
+        "Diarization is mandatory. Vukho.AI will require WhisperX, pyannote, and CUDA preflight to pass before audio processing continues.",
+    );
+    run_mandatory_runtime_preflight(
+        shared,
+        job_id,
+        &settings,
+        &job,
+        &python_binary,
+        &output_path,
+        &meta_path,
+    )?;
 
     let _ = append_performance_log_to_job(
         shared,
@@ -1271,36 +1520,6 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
     let _ = persist_state(&shared.core);
     emit_full_state(&shared.core);
 
-    let output_path = output_txt_path(&settings, &job);
-    let meta_path = shared
-        .core
-        .metadata_dir
-        .join(format!("{}.json", job.id))
-        .to_string_lossy()
-        .into_owned();
-
-    if let Some(parent) = Path::new(&output_path).parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Unable to prepare output directory: {e}"))?;
-    }
-
-    let python_binary =
-        resolve_python_binary(&settings, &shared.core.script_path, job.diarization_enabled)?;
-    let _ = append_performance_log_to_job(
-        shared,
-        job_id,
-        "runtime",
-        format!(
-            "Selected Python runtime: {}{}",
-            python_binary,
-            if job.diarization_enabled {
-                " (diarization enabled)"
-            } else {
-                ""
-            }
-        ),
-    );
-
     let mut command = Command::new(&python_binary);
     configure_python_command(&mut command, &python_binary);
     command
@@ -1316,7 +1535,7 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
         .arg("--language")
         .arg(job.language_mode.python_flag())
         .arg("--diarization")
-        .arg(if job.diarization_enabled { "on" } else { "off" })
+        .arg("on")
         .arg("--duration-seconds")
         .arg(format!("{:.3}", prepared.duration_seconds))
         .stdout(Stdio::piped())
@@ -1437,10 +1656,7 @@ fn run_job(shared: &AppShared, job_id: &str) -> Result<RunResult, String> {
 }
 
 fn apply_runtime_line(shared: &AppShared, job_id: &str, line: &str) -> bool {
-    if let Some(payload) = line
-        .strip_prefix("VUKHOAI_DIAG ")
-        .or_else(|| line.strip_prefix("GHOSTMIC_DIAG "))
-    {
+    if let Some(payload) = line.strip_prefix("VUKHOAI_DIAG ") {
         let parsed = serde_json::from_str::<DiagnosticPayload>(payload);
         let Ok(diagnostic) = parsed else {
             return false;
@@ -1462,10 +1678,7 @@ fn apply_runtime_line(shared: &AppShared, job_id: &str, line: &str) -> bool {
         return true;
     }
 
-    if let Some(payload) = line
-        .strip_prefix("VUKHOAI_RUNTIME ")
-        .or_else(|| line.strip_prefix("GHOSTMIC_RUNTIME "))
-    {
+    if let Some(payload) = line.strip_prefix("VUKHOAI_RUNTIME ") {
         let parsed = serde_json::from_str::<RuntimePayload>(payload);
         let Ok(runtime) = parsed else {
             return false;
@@ -1538,10 +1751,7 @@ fn apply_runtime_line(shared: &AppShared, job_id: &str, line: &str) -> bool {
         return true;
     }
 
-    if let Some(payload) = line
-        .strip_prefix("VUKHOAI_NOTICE ")
-        .or_else(|| line.strip_prefix("GHOSTMIC_NOTICE "))
-    {
+    if let Some(payload) = line.strip_prefix("VUKHOAI_NOTICE ") {
         let parsed = serde_json::from_str::<NoticePayload>(payload);
         let Ok(notice) = parsed else {
             return false;
@@ -1562,10 +1772,7 @@ fn apply_runtime_line(shared: &AppShared, job_id: &str, line: &str) -> bool {
         return true;
     }
 
-    let Some(payload) = line
-        .strip_prefix("VUKHOAI_PROGRESS ")
-        .or_else(|| line.strip_prefix("GHOSTMIC_PROGRESS "))
-    else {
+    let Some(payload) = line.strip_prefix("VUKHOAI_PROGRESS ") else {
         return false;
     };
 
@@ -1766,30 +1973,22 @@ fn output_txt_path(settings: &AppSettings, job: &ImportJob) -> String {
 fn resolve_python_binary(
     settings: &AppSettings,
     script_path: &Path,
-    diarization_enabled: bool,
+    _diarization_enabled: bool,
 ) -> Result<String, String> {
     let mut candidates: Vec<String> = Vec::new();
 
-    if diarization_enabled {
-        if let Some(value) = settings
-            .diarization_python_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
-            candidates.push(value.to_string());
-        }
+    if let Some(value) = settings
+        .diarization_python_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        candidates.push(value.to_string());
+    }
 
-        if let Ok(env_python) = std::env::var("VUKHOAI_DIARIZATION_PYTHON") {
-            if !env_python.trim().is_empty() {
-                candidates.push(env_python);
-            }
-        }
-
-        if let Ok(env_python) = std::env::var("GHOSTMIC_DIARIZATION_PYTHON") {
-            if !env_python.trim().is_empty() {
-                candidates.push(env_python);
-            }
+    if let Ok(env_python) = std::env::var("VUKHOAI_DIARIZATION_PYTHON") {
+        if !env_python.trim().is_empty() {
+            candidates.push(env_python);
         }
     }
 
@@ -1808,21 +2007,11 @@ fn resolve_python_binary(
         }
     }
 
-    if let Ok(env_python) = std::env::var("GHOSTMIC_PYTHON") {
-        if !env_python.trim().is_empty() {
-            candidates.push(env_python);
-        }
-    }
-
-    candidates.extend(discover_local_python_candidates(
-        script_path,
-        diarization_enabled,
-    ));
+    candidates.extend(discover_local_python_candidates(script_path, true));
     candidates.push("python3".to_string());
     candidates.push("python".to_string());
 
     let mut seen: HashSet<String> = HashSet::new();
-    let mut transcription_capable_fallback: Option<String> = None;
     let mut missing_transcription_for: Vec<String> = Vec::new();
     let mut missing_diarization_for: Vec<String> = Vec::new();
 
@@ -1835,43 +2024,33 @@ fn resolve_python_binary(
             continue;
         };
 
-        if diarization_enabled && capabilities.supports_diarization() {
+        if capabilities.supports_diarization() {
             return Ok(candidate);
         }
 
         if capabilities.supports_transcription() {
-            if transcription_capable_fallback.is_none() {
-                transcription_capable_fallback = Some(candidate.clone());
-            }
-
-            if diarization_enabled && !capabilities.supports_diarization() {
-                missing_diarization_for.push(candidate);
-            }
+            missing_diarization_for.push(candidate);
             continue;
         }
 
         missing_transcription_for.push(candidate);
     }
 
-    if let Some(candidate) = transcription_capable_fallback {
-        return Ok(candidate);
-    }
-
-    if !missing_transcription_for.is_empty() {
+    if !missing_diarization_for.is_empty() {
         return Err(format!(
-            "Transcription runtime is not ready. Reinstall the Windows portable package or choose a working runtime in Settings. Checked runtimes: {}",
-            missing_transcription_for.join(", ")
-        ));
-    }
-
-    if diarization_enabled && !missing_diarization_for.is_empty() {
-        return Err(format!(
-            "Diarization runtime is not ready. The app can still transcribe without diarization, or you can choose a working diarization runtime in Settings. Checked runtimes: {}",
+            "Mandatory diarization runtime is not ready. Audio processing will not start until WhisperX and pyannote are available in a working GPU runtime. Checked runtimes: {}",
             missing_diarization_for.join(", ")
         ));
     }
 
-    Err("Bundled transcription runtime was not found. Reinstall the Windows portable package or choose a working runtime in Settings.".to_string())
+    if !missing_transcription_for.is_empty() {
+        return Err(format!(
+            "Mandatory transcription + diarization runtime is not ready. Audio processing will not start. Checked runtimes: {}",
+            missing_transcription_for.join(", ")
+        ));
+    }
+
+    Err("Bundled diarization runtime was not found. Reinstall the Windows portable package or choose a working runtime in Settings.".to_string())
 }
 
 fn configure_python_command(command: &mut Command, python_binary: &str) {
@@ -1924,10 +2103,36 @@ def can_import(name, attr=None):
     except Exception:
         return False
 
+def torch_cuda_state():
+    try:
+        import torch
+        available = bool(torch.cuda.is_available())
+        count = int(torch.cuda.device_count()) if available else 0
+        if available and count > 0:
+            torch.cuda.init()
+            probe = torch.zeros(1, device="cuda:0")
+            _ = probe + 1
+            torch.cuda.synchronize(0)
+        return available, count
+    except Exception:
+        return False, 0
+
+def ctranslate2_cuda_count():
+    try:
+        import ctranslate2
+        return int(ctranslate2.get_cuda_device_count())
+    except Exception:
+        return 0
+
+torch_cuda_available, torch_cuda_device_count = torch_cuda_state()
+
 print(json.dumps({
     "faster_whisper": can_import("faster_whisper", "WhisperModel"),
     "whisperx": can_import("whisperx"),
     "pyannote_audio": can_import("pyannote.audio"),
+    "torch_cuda_available": torch_cuda_available,
+    "torch_cuda_device_count": torch_cuda_device_count,
+    "ctranslate2_cuda_device_count": ctranslate2_cuda_count(),
 }))
 "#;
 
@@ -1944,6 +2149,9 @@ print(json.dumps({
         has_faster_whisper: parsed.faster_whisper,
         has_whisperx: parsed.whisperx,
         has_pyannote_audio: parsed.pyannote_audio,
+        torch_cuda_available: parsed.torch_cuda_available,
+        torch_cuda_device_count: parsed.torch_cuda_device_count,
+        ctranslate2_cuda_device_count: parsed.ctranslate2_cuda_device_count,
     })
 }
 
@@ -2043,10 +2251,6 @@ fn default_output_directory() -> PathBuf {
     documents_directory().join("VukhoAI").join("Exports")
 }
 
-fn legacy_default_output_directory() -> PathBuf {
-    documents_directory().join("GhostMic").join("Exports")
-}
-
 fn documents_directory() -> PathBuf {
     dirs::document_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
@@ -2055,11 +2259,6 @@ fn documents_directory() -> PathBuf {
 fn migrate_output_folder_path_if_needed(path: &str) -> String {
     let trimmed = path.trim();
     if trimmed.is_empty() {
-        return default_output_directory().to_string_lossy().into_owned();
-    }
-
-    let candidate = PathBuf::from(trimmed);
-    if candidate == legacy_default_output_directory() {
         return default_output_directory().to_string_lossy().into_owned();
     }
 
@@ -2306,7 +2505,7 @@ fn resolve_script_path(app: &tauri::App) -> Result<PathBuf, String> {
             .join("..")
             .join("..")
             .join("Sources")
-            .join("GhostMicApp")
+            .join("VukhoAIApp")
             .join("Resources")
             .join("transcribe.py"),
     );
@@ -2372,11 +2571,14 @@ fn build_shared_state(app: &tauri::App) -> Result<AppShared, String> {
     let store_path = app_data.join("state.json");
     let normalized_dir = app_data.join("normalized_audio");
     let metadata_dir = app_data.join("metadata");
+    let recording_temp_dir = app_data.join("recording_temp");
 
     fs::create_dir_all(&normalized_dir)
         .map_err(|e| format!("Unable to create normalized audio directory: {e}"))?;
     fs::create_dir_all(&metadata_dir)
         .map_err(|e| format!("Unable to create metadata directory: {e}"))?;
+    fs::create_dir_all(&recording_temp_dir)
+        .map_err(|e| format!("Unable to create recording temp directory: {e}"))?;
 
     let mut persisted = if store_path.exists() {
         let content = fs::read_to_string(&store_path)
@@ -2415,7 +2617,9 @@ fn build_shared_state(app: &tauri::App) -> Result<AppShared, String> {
             store_path,
             normalized_dir,
             metadata_dir,
+            recording_temp_dir,
             script_path,
+            recording: recording::RecordingManager::new(),
             worker: Mutex::new(WorkerState {
                 persisted,
                 worker_running: false,
@@ -2439,6 +2643,24 @@ fn migrate_persisted_state(persisted: &mut PersistedState) {
         persisted.schema_version = 2;
     }
 
+    if persisted.schema_version < 3 {
+        persisted.schema_version = 3;
+    }
+
+    if persisted.schema_version < 4 {
+        persisted.settings.diarization_enabled = true;
+        for job in &mut persisted.jobs {
+            if matches!(job.status, JobStatus::Queued | JobStatus::Processing) {
+                job.diarization_enabled = true;
+            }
+        }
+        persisted.schema_version = 4;
+    }
+
+    if persisted.schema_version < 5 {
+        persisted.schema_version = 5;
+    }
+
     if persisted.schema_version < STATE_SCHEMA_VERSION {
         persisted.schema_version = STATE_SCHEMA_VERSION;
     }
@@ -2451,7 +2673,7 @@ fn build_job_notice(core: &AppCore, meta_path: &str) -> Option<String> {
         return None;
     }
 
-    let mut message = String::from("Diarization was skipped.");
+    let mut message = String::from("Diarization did not complete.");
     let fallback_event = metadata
         .fallback_events
         .iter()
@@ -2483,7 +2705,7 @@ fn build_job_notice(core: &AppCore, meta_path: &str) -> Option<String> {
     if missing_stack {
         message.push(' ');
         message.push_str(
-            "Install whisperx + pyannote into a separate Python 3.11/3.12 env, then set Settings -> Diarization Python.",
+            "Speaker diarization is mandatory. Reinstall the Windows package, or if you manage your own Python runtimes, choose a working diarization runtime in Settings.",
         );
     }
 
@@ -2642,12 +2864,19 @@ pub fn run() {
             get_state,
             update_settings,
             enqueue_job,
+            queue_ready_job,
+            get_recording_state,
+            get_recording_devices,
+            start_recording,
+            stop_recording,
+            cancel_recording,
             retry_job,
             re_transcribe,
             cancel_job,
             pause_job,
             resume_job,
             delete_job,
+            clear_jobs,
             get_transcript_speakers,
             update_speaker_aliases,
             read_transcript,

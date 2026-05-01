@@ -6,14 +6,14 @@
 
 ## Cross-platform (macOS + Windows)
 
-Додано окремий Tauri застосунок у папці `ghostmic-cross/`.
+Додано окремий Tauri застосунок у папці `vukhoai-cross/`.
 
-- Документація запуску: [ghostmic-cross/README.md](ghostmic-cross/README.md)
+- Документація запуску: [vukhoai-cross/README.md](vukhoai-cross/README.md)
 - Windows one-click path: double-click `Build Windows Portable.cmd` in the repo root. It first tries to download the latest ready-made Windows app from GitHub Releases and only falls back to local compilation if the Windows machine already has the toolchain installed.
 - Dev запуск:
 
 ```bash
-cd ghostmic-cross
+cd vukhoai-cross
 npm install
 npm run tauri dev
 ```
@@ -113,7 +113,7 @@ swift run VukhoAI
 Якщо потрібно примусово вказати Python для app:
 
 ```bash
-export VUKHOAI_PYTHON="/Users/admin/Documents/Development - Codex/GhostMic/.venv/bin/python3"
+export VUKHOAI_PYTHON="/Users/admin/Documents/Development - Codex/Vukho.AI/.venv/bin/python3"
 swift run VukhoAI
 ```
 
@@ -172,10 +172,10 @@ swift run VukhoAI
 Виконайте:
 
 ```bash
-cd "/Users/admin/Documents/Development - Codex/GhostMic"
+cd "/Users/admin/Documents/Development - Codex/Vukho.AI"
 source .venv/bin/activate
 pip install -r Scripts/requirements.txt
-export VUKHOAI_PYTHON="/Users/admin/Documents/Development - Codex/GhostMic/.venv/bin/python3"
+export VUKHOAI_PYTHON="/Users/admin/Documents/Development - Codex/Vukho.AI/.venv/bin/python3"
 swift run VukhoAI
 ```
 
@@ -194,11 +194,11 @@ swift run VukhoAI
 ## 7) Команди швидкого старту (копіпаст)
 
 ```bash
-cd "/Users/admin/Documents/Development - Codex/GhostMic"
+cd "/Users/admin/Documents/Development - Codex/Vukho.AI"
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r Scripts/requirements.txt
-export VUKHOAI_PYTHON="/Users/admin/Documents/Development - Codex/GhostMic/.venv/bin/python3"
+export VUKHOAI_PYTHON="/Users/admin/Documents/Development - Codex/Vukho.AI/.venv/bin/python3"
 swift run VukhoAI
 ```
 

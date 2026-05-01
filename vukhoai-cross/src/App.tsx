@@ -6,7 +6,7 @@ import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 import earLogo from "./assets/vukho-ear-logo.svg";
 
-type JobStatus = "queued" | "processing" | "done" | "failed" | "cancelled";
+type JobStatus = "ready" | "queued" | "processing" | "done" | "failed" | "cancelled";
 type Profile = "maximum_quality" | "balanced" | "fast_economy";
 type LanguageMode = "auto" | "ukrainian";
 type ThemeMode = "dark" | "light";
@@ -74,12 +74,35 @@ interface AppSnapshot {
   settings: AppSettings;
 }
 
+interface RecordingState {
+  active: boolean;
+  id?: string | null;
+  title?: string | null;
+  started_at?: string | null;
+  elapsed_seconds?: number | null;
+  system_device?: string | null;
+  microphone_device?: string | null;
+}
+
+interface RecordingDevice {
+  id: string;
+  name: string;
+  is_default: boolean;
+}
+
+interface RecordingDevices {
+  system_devices: RecordingDevice[];
+  microphone_devices: RecordingDevice[];
+}
+
 type ListFilter = "all" | "completed_only";
 type RuntimeTone = "gpu" | "cpu" | "detecting";
 
-const JOBS_EVENT = "ghostmic://jobs-updated";
-const SETTINGS_EVENT = "ghostmic://settings-updated";
-const THEME_STORAGE_KEY = "ghostmic.theme_mode";
+const JOBS_EVENT = "vukhoai://jobs-updated";
+const SETTINGS_EVENT = "vukhoai://settings-updated";
+const THEME_STORAGE_KEY = "vukhoai.theme_mode";
+const RECORDING_SYSTEM_DEVICE_KEY = "vukhoai.recording.system_device_id";
+const RECORDING_MICROPHONE_DEVICE_KEY = "vukhoai.recording.microphone_device_id";
 
 const profileLabels: Record<Profile, string> = {
   maximum_quality: "Maximum Quality",
@@ -98,6 +121,26 @@ function resolveInitialThemeMode(): ThemeMode {
     return stored === "light" ? "light" : "dark";
   } catch {
     return "dark";
+  }
+}
+
+function readStoredValue(key: string): string {
+  try {
+    return window.localStorage.getItem(key) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeStoredValue(key: string, value: string) {
+  try {
+    if (value) {
+      window.localStorage.setItem(key, value);
+    } else {
+      window.localStorage.removeItem(key);
+    }
+  } catch {
+    // Ignore storage failures; the current in-memory selection still applies.
   }
 }
 
@@ -121,6 +164,19 @@ function App() {
   const [liveTick, setLiveTick] = useState<number>(Date.now());
   const [themeMode, setThemeMode] = useState<ThemeMode>(resolveInitialThemeMode);
   const [dragActive, setDragActive] = useState(false);
+  const [recordingTitle, setRecordingTitle] = useState("");
+  const [recordingState, setRecordingState] = useState<RecordingState>({ active: false });
+  const [recordingDevices, setRecordingDevices] = useState<RecordingDevices>({
+    system_devices: [],
+    microphone_devices: [],
+  });
+  const [selectedSystemDeviceId, setSelectedSystemDeviceId] = useState(() =>
+    readStoredValue(RECORDING_SYSTEM_DEVICE_KEY),
+  );
+  const [selectedMicrophoneDeviceId, setSelectedMicrophoneDeviceId] = useState(() =>
+    readStoredValue(RECORDING_MICROPHONE_DEVICE_KEY),
+  );
+  const [recordingBusy, setRecordingBusy] = useState(false);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState<AppSettings | null>(null);
@@ -156,8 +212,30 @@ function App() {
   }, [jobs, listFilter]);
 
   const hasQueuedOrProcessingJobs = useMemo(
-    () => jobs.some((job) => job.status === "queued" || job.status === "processing"),
+    () => jobs.some((job) => job.status === "ready" || job.status === "queued" || job.status === "processing"),
     [jobs],
+  );
+
+  const recordingElapsedSeconds = useMemo(() => {
+    if (!recordingState.active) {
+      return recordingState.elapsed_seconds ?? 0;
+    }
+
+    const startedAt = recordingState.started_at ? Date.parse(recordingState.started_at) : NaN;
+    if (Number.isFinite(startedAt)) {
+      return Math.max(0, (liveTick - startedAt) / 1000);
+    }
+
+    return recordingState.elapsed_seconds ?? 0;
+  }, [recordingState, liveTick]);
+
+  const defaultSystemDevice = useMemo(
+    () => recordingDevices.system_devices.find((device) => device.is_default) ?? null,
+    [recordingDevices.system_devices],
+  );
+  const defaultMicrophoneDevice = useMemo(
+    () => recordingDevices.microphone_devices.find((device) => device.is_default) ?? null,
+    [recordingDevices.microphone_devices],
   );
 
   const loadInitialState = useCallback(async () => {
@@ -206,10 +284,12 @@ function App() {
 
   useEffect(() => {
     void loadInitialState();
+    void refreshRecordingState();
+    void refreshRecordingDevices();
 
     const interval = setInterval(() => {
       setLiveTick(Date.now());
-    }, 5000);
+    }, 1000);
 
     let stopJobs: (() => void) | null = null;
     let stopSettings: (() => void) | null = null;
@@ -231,6 +311,24 @@ function App() {
       stopSettings?.();
     };
   }, [loadInitialState]);
+
+  async function refreshRecordingState() {
+    try {
+      const state = await invoke<RecordingState>("get_recording_state");
+      setRecordingState(state);
+    } catch {
+      setRecordingState({ active: false });
+    }
+  }
+
+  async function refreshRecordingDevices() {
+    try {
+      const devices = await invoke<RecordingDevices>("get_recording_devices");
+      setRecordingDevices(devices);
+    } catch {
+      setRecordingDevices({ system_devices: [], microphone_devices: [] });
+    }
+  }
 
   useEffect(() => {
     document.documentElement.dataset.theme = themeMode;
@@ -414,6 +512,99 @@ function App() {
       await invoke("retry_job", { jobId });
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function queueReadyJob(jobId: string) {
+    setErrorMessage("");
+    try {
+      await invoke("queue_ready_job", { jobId });
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function chooseSystemDevice(deviceId: string) {
+    setSelectedSystemDeviceId(deviceId);
+    writeStoredValue(RECORDING_SYSTEM_DEVICE_KEY, deviceId);
+  }
+
+  function chooseMicrophoneDevice(deviceId: string) {
+    setSelectedMicrophoneDeviceId(deviceId);
+    writeStoredValue(RECORDING_MICROPHONE_DEVICE_KEY, deviceId);
+  }
+
+  async function startRecording() {
+    if (recordingBusy || recordingState.active) {
+      return;
+    }
+
+    setErrorMessage("");
+    setRecordingBusy(true);
+    try {
+      const state = await invoke<RecordingState>("start_recording", {
+        title: recordingTitle,
+        systemDeviceId: selectedSystemDeviceId || null,
+        microphoneDeviceId: selectedMicrophoneDeviceId || null,
+      });
+      setRecordingState(state);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRecordingBusy(false);
+    }
+  }
+
+  async function stopRecording() {
+    if (recordingBusy || !recordingState.active) {
+      return;
+    }
+
+    setErrorMessage("");
+    setRecordingBusy(true);
+    try {
+      const job = await invoke<ImportJob>("stop_recording");
+      setRecordingState({ active: false });
+      setRecordingTitle("");
+
+      const accepted = await confirm(`Transcribe "${job.input_filename}" now?`, {
+        title: "Recording Saved",
+        kind: "info",
+      });
+      if (accepted) {
+        await invoke("queue_ready_job", { jobId: job.id });
+      }
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : String(error));
+      await refreshRecordingState();
+    } finally {
+      setRecordingBusy(false);
+    }
+  }
+
+  async function cancelRecording() {
+    if (recordingBusy || !recordingState.active) {
+      return;
+    }
+
+    const accepted = await confirm("Cancel this recording and delete the temporary audio?", {
+      title: "Cancel Recording",
+      kind: "warning",
+    });
+    if (!accepted) {
+      return;
+    }
+
+    setErrorMessage("");
+    setRecordingBusy(true);
+    try {
+      await invoke("cancel_recording");
+      setRecordingState({ active: false });
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : String(error));
+      await refreshRecordingState();
+    } finally {
+      setRecordingBusy(false);
     }
   }
 
@@ -679,7 +870,7 @@ function App() {
           <img className="brand-logo" src={earLogo} alt="Vukho.AI ear logo" />
           <div>
             <h1>Vukho.AI</h1>
-            <p>Offline transcription (.m4a/.mp4) for macOS and Windows.</p>
+            <p>Offline transcription with speaker diarization (.m4a/.mp4) for macOS and Windows.</p>
           </div>
         </div>
         <div className="topbar-actions">
@@ -689,6 +880,94 @@ function App() {
           <button onClick={openSettings}>Settings</button>
         </div>
       </header>
+
+      <section className={`panel record-panel ${recordingState.active ? "recording-active" : ""}`}>
+        <div className="record-header">
+          <div>
+            <h2>Record</h2>
+            <p>Capture computer audio and microphone into a ready-to-transcribe `.m4a` file.</p>
+          </div>
+          <div className={`record-live ${recordingState.active ? "on" : ""}`}>
+            <span className="record-dot" aria-hidden="true" />
+            <span>{recordingState.active ? "Recording" : "Idle"}</span>
+          </div>
+        </div>
+
+        <div className="record-controls">
+          <label className="record-title-field">
+            <span>Title</span>
+            <input
+              type="text"
+              value={recordingTitle}
+              placeholder="Meeting, call, lecture..."
+              disabled={recordingState.active || recordingBusy}
+              onChange={(event) => setRecordingTitle(event.target.value)}
+            />
+          </label>
+          <div className="record-timer">{formatClock(recordingElapsedSeconds)}</div>
+          <div className="record-actions">
+            {!recordingState.active ? (
+              <button className="primary" onClick={startRecording} disabled={recordingBusy}>
+                {recordingBusy ? "Starting..." : "Start Recording"}
+              </button>
+            ) : (
+              <>
+                <button className="primary" onClick={stopRecording} disabled={recordingBusy}>
+                  {recordingBusy ? "Saving..." : "Stop & Save"}
+                </button>
+                <button onClick={cancelRecording} disabled={recordingBusy}>
+                  Cancel
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+
+        <div className="record-device-selectors">
+          <label className="record-device-field">
+            <span>System audio</span>
+            <select
+              value={selectedSystemDeviceId}
+              disabled={recordingState.active || recordingBusy}
+              onChange={(event) => chooseSystemDevice(event.target.value)}
+            >
+              <option value="">
+                Default output{defaultSystemDevice ? ` (${defaultSystemDevice.name})` : ""}
+              </option>
+              {recordingDevices.system_devices.map((device) => (
+                <option key={device.id} value={device.id}>
+                  {device.name}{device.is_default ? " (default)" : ""}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="record-device-field">
+            <span>Microphone</span>
+            <select
+              value={selectedMicrophoneDeviceId}
+              disabled={recordingState.active || recordingBusy}
+              onChange={(event) => chooseMicrophoneDevice(event.target.value)}
+            >
+              <option value="">
+                Default microphone{defaultMicrophoneDevice ? ` (${defaultMicrophoneDevice.name})` : ""}
+              </option>
+              {recordingDevices.microphone_devices.map((device) => (
+                <option key={device.id} value={device.id}>
+                  {device.name}{device.is_default ? " (default)" : ""}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button onClick={refreshRecordingDevices} disabled={recordingState.active || recordingBusy}>
+            Refresh devices
+          </button>
+        </div>
+
+        <div className="record-devices">
+          <span>System: {recordingState.system_device || "default output"}</span>
+          <span>Mic: {recordingState.microphone_device || "default microphone"}</span>
+        </div>
+      </section>
 
       <section className={`panel import-panel ${dragActive ? "drag-active" : ""}`}>
         <h2>Import</h2>
@@ -704,7 +983,7 @@ function App() {
           />
           <button onClick={pickInputFile}>Import File...</button>
           <button className="primary" onClick={enqueueSelected}>
-            Transcribe
+            Transcribe & diarize
           </button>
         </div>
         {dragActive && <div className="import-drop-overlay">Drop files to queue transcription</div>}
@@ -793,7 +1072,7 @@ function App() {
                   {fallbackReason && (
                     <div className="fallback-panel">
                       <div className="fallback-header">
-                        <span>Fallback reason</span>
+                        <span>Runtime issue</span>
                         <button type="button" className="fallback-copy" onClick={() => void copyFallbackReason(job)}>
                           Copy reason
                         </button>
@@ -817,6 +1096,10 @@ function App() {
                         <button onClick={() => openTranscript(job.id)}>Open</button>
                         <button onClick={() => reTranscribe(job.id)}>Re-transcribe</button>
                       </>
+                    )}
+
+                    {job.status === "ready" && (
+                      <button onClick={() => queueReadyJob(job.id)}>Transcribe</button>
                     )}
 
                     {job.status === "queued" && (
@@ -995,19 +1278,10 @@ function App() {
                 </select>
               </label>
 
-              <label className="checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={settingsDraft.diarization_enabled}
-                  onChange={(e) =>
-                    setSettingsDraft({
-                      ...settingsDraft,
-                      diarization_enabled: e.target.checked,
-                    })
-                  }
-                />
-                Enable diarization
-              </label>
+              <div className="checkbox-row">
+                <input type="checkbox" checked readOnly />
+                Speaker diarization required
+              </div>
 
               <label>
                 Output folder
@@ -1037,7 +1311,7 @@ function App() {
                       python_path: e.target.value,
                     })
                   }
-                  placeholder="Leave empty to use python3/python"
+                  placeholder="Leave empty to use the bundled or auto-detected runtime"
                 />
               </label>
 
@@ -1052,7 +1326,7 @@ function App() {
                       diarization_python_path: e.target.value,
                     })
                   }
-                  placeholder="Recommended: separate Python 3.11/3.12 env with whisperx + pyannote"
+                  placeholder="Optional advanced override for speaker diarization"
                 />
               </label>
 
@@ -1101,8 +1375,9 @@ function App() {
             </div>
 
             <div className="settings-note">
-              Speaker diarization needs a Python env with `whisperx` + `pyannote.audio`.
-              The app will auto-try `.venv-diarization`, but you can point to any ready env here.
+              Most users should leave both Python fields empty. The app will prefer the bundled
+              diarization runtime and stop before processing if WhisperX, pyannote, and CUDA are
+              not ready.
             </div>
 
             {settingsStatus && <div className="banner ok">{settingsStatus}</div>}
@@ -1337,12 +1612,12 @@ function buildFallbackReason(job: ImportJob): string | null {
     blocks.push(
       runtimeContext
         ? `Transcription runtime: ${runtimeContext}\nReason: ${runtimeReason}`
-        : `Transcription runtime fallback:\n${runtimeReason}`,
+        : `Transcription runtime issue:\n${runtimeReason}`,
     );
   }
 
   if (diarizationReason) {
-    blocks.push(`Diarization fallback:\n${diarizationReason}`);
+    blocks.push(`Diarization issue:\n${diarizationReason}`);
   }
 
   const uniqueBlocks = [...new Set(blocks)];

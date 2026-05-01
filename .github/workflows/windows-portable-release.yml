@@ -9,7 +9,7 @@ on:
       - ".github/workflows/windows-portable-release.yml"
       - "Build Windows Portable.cmd"
       - "Scripts/**"
-      - "ghostmic-cross/**"
+      - "vukhoai-cross/**"
 
 permissions:
   contents: write
@@ -30,7 +30,7 @@ jobs:
         with:
           node-version: "20"
           cache: "npm"
-          cache-dependency-path: ghostmic-cross/package-lock.json
+          cache-dependency-path: vukhoai-cross/package-lock.json
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -40,9 +40,17 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Ensure ffmpeg is available for recording support
+        run: |
+          if (-not (Get-Command ffmpeg.exe -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg -y --no-progress
+          }
+          ffmpeg -version
+          ffprobe -version
+
       - name: Seed portable settings from repository secrets
         run: |
-          $portableDir = Join-Path $PWD "ghostmic-cross\portable-build"
+          $portableDir = Join-Path $PWD "vukhoai-cross\portable-build"
           New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
 
           $settings = @{
@@ -74,20 +82,21 @@ jobs:
 
       - name: Package release ZIP
         run: |
-          $portableRoot = Join-Path $PWD "ghostmic-cross\portable-build\windows\Vukho.AI-Windows-Portable"
-          $zipPath = Join-Path $PWD "ghostmic-cross\portable-build\windows\Vukho.AI-Windows-Portable.zip"
+          $portableRoot = Join-Path $PWD "vukhoai-cross\portable-build\windows\Vukho.AI-Windows-Portable"
+          $zipPath = Join-Path $PWD "vukhoai-cross\portable-build\windows\Vukho.AI-Windows-Portable.zip"
+          .\Scripts\package_windows_portable_zip.ps1 -SourceRoot $portableRoot -ZipPath $zipPath
 
-          if (Test-Path $zipPath) {
-            Remove-Item $zipPath -Force
-          }
-
-          Compress-Archive -Path $portableRoot -DestinationPath $zipPath -Force
+      - name: Split release assets for GitHub size limits
+        run: |
+          $zipPath = Join-Path $PWD "vukhoai-cross\portable-build\windows\Vukho.AI-Windows-Portable.zip"
+          $releaseAssets = Join-Path $PWD "vukhoai-cross\portable-build\windows\release-assets"
+          .\Scripts\split_windows_release_asset.ps1 -SourceZipPath $zipPath -OutputDirectory $releaseAssets
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: Vukho.AI-Windows-Portable
-          path: ghostmic-cross/portable-build/windows/Vukho.AI-Windows-Portable.zip
+          path: vukhoai-cross/portable-build/windows/release-assets/*
           if-no-files-found: error
 
       - name: Publish stable release ZIP
@@ -95,11 +104,11 @@ jobs:
         with:
           allowUpdates: true
           artifactErrorsFailBuild: true
-          artifacts: ghostmic-cross/portable-build/windows/Vukho.AI-Windows-Portable.zip
+          artifacts: vukhoai-cross/portable-build/windows/release-assets/*
           body: |
             Latest ready-to-run portable Windows build for Vukho.AI.
 
-            Download `Vukho.AI-Windows-Portable.zip`, extract it, and run the `.exe` inside.
+            The portable bootstrap script downloads and reassembles the release parts automatically.
           makeLatest: true
           name: Windows Portable Build (Latest)
           prerelease: false

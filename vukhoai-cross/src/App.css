@@ -222,9 +222,149 @@ select:disabled {
   opacity: 0.95;
 }
 
+.record-panel,
 .import-panel,
 .list-panel {
   padding: 20px;
+}
+
+.record-panel {
+  display: grid;
+  gap: 16px;
+}
+
+.record-panel.recording-active {
+  border-color: rgba(242, 183, 5, 0.48);
+  box-shadow: 0 0 0 3px rgba(242, 183, 5, 0.12), var(--shadow-md);
+}
+
+.record-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.record-header h2 {
+  margin: 0 0 8px;
+  font-size: 0.83rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+
+.record-header p {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: 0.92rem;
+}
+
+.record-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-muted);
+  color: var(--color-text-secondary);
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.record-live.on {
+  color: var(--color-primary-text);
+  background: var(--color-primary);
+  border-color: rgba(242, 183, 5, 0.58);
+}
+
+.record-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.record-live.on .record-dot {
+  animation: runtime-pulse 1.2s ease-in-out infinite;
+}
+
+.record-controls {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.record-title-field {
+  display: grid;
+  gap: 6px;
+}
+
+.record-title-field span {
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.record-timer {
+  min-width: 122px;
+  min-height: 48px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--color-border);
+  border-radius: 16px;
+  background: rgba(0, 0, 0, 0.14);
+  font-family: var(--font-mono);
+  font-size: 1.22rem;
+  font-weight: 700;
+  color: var(--color-text);
+}
+
+.record-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.record-device-selectors {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.record-device-field {
+  display: grid;
+  gap: 6px;
+}
+
+.record-device-field span {
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.record-devices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--color-text-secondary);
+  font-size: 0.86rem;
+}
+
+.record-devices span {
+  padding: 7px 10px;
+  border-radius: 999px;
+  background: var(--color-surface-muted);
+  border: 1px solid var(--color-border);
 }
 
 .import-panel {
@@ -696,6 +836,12 @@ progress::-moz-progress-bar {
   border-color: rgba(242, 183, 5, 0.34);
 }
 
+.status.ready {
+  color: #ffffff;
+  background: rgba(0, 87, 183, 0.34);
+  border-color: rgba(0, 87, 183, 0.5);
+}
+
 @keyframes runtime-pulse {
   0%,
   100% {
@@ -1038,6 +1184,20 @@ progress::-moz-progress-bar {
   }
 
   .actions {
+    justify-content: flex-start;
+  }
+
+  .record-header,
+  .record-controls,
+  .record-device-selectors {
+    grid-template-columns: 1fr;
+  }
+
+  .record-header {
+    flex-direction: column;
+  }
+
+  .record-actions {
     justify-content: flex-start;
   }
 

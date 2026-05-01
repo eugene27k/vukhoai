@@ -31,13 +31,13 @@ python3 Scripts/export_portable_state.py
 
 This writes:
 
-`ghostmic-cross/portable-build/portable-state.local.json`
+`vukhoai-cross/portable-build/portable-state.local.json`
 
 Included:
 
 - default profile
 - language mode
-- diarization on/off
+- mandatory speaker diarization
 - Hugging Face token
 - OpenAI model
 - OpenAI API key
@@ -59,10 +59,13 @@ On Windows, double-click:
 Default behavior:
 
 - tries to download the latest ready-to-run Windows ZIP from GitHub Releases
-- extracts it into `ghostmic-cross/portable-build/windows/`
+- extracts it into `vukhoai-cross/portable-build/windows/`
+- validates that the extracted package contains the embedded Python runtime and ready transcription modules
 - opens the folder when done
 
 If no release ZIP is available yet, it falls back to a local source build only when the machine already has the required toolchain.
+
+If the downloaded ZIP is stale or incomplete, the bootstrap script now rejects it instead of launching a broken app.
 
 What the local fallback does automatically:
 
@@ -95,11 +98,11 @@ If you explicitly want to compile locally from source, run:
 powershell -ExecutionPolicy Bypass -File .\Scripts\build_windows_portable.ps1 -FfmpegDir "C:\path\to\ffmpeg\bin"
 ```
 
-If you deliberately want a smaller transcription-only package, add `-SkipDiarizationRuntime`.
+`-SkipDiarizationRuntime` is rejected by the build script because normal jobs require diarization.
 
 Output:
 
-`ghostmic-cross/portable-build/windows/Vukho.AI-Windows-Portable/`
+`vukhoai-cross/portable-build/windows/Vukho.AI-Windows-Portable/`
 
 The resulting folder contains the app `.exe` plus everything the runtime can auto-discover.
 

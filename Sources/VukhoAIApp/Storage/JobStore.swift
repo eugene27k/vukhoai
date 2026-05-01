@@ -4,7 +4,7 @@ import Foundation
 final class JobStore: ObservableObject {
     @Published private(set) var jobs: [ImportJob] = []
 
-    let paths: GhostMicPaths
+    let paths: VukhoAIPaths
 
     private let repository: JobRepository
     private let settings: AppSettings
@@ -12,7 +12,7 @@ final class JobStore: ObservableObject {
     init(settings: AppSettings) {
         self.settings = settings
         do {
-            paths = try GhostMicPaths.build()
+            paths = try VukhoAIPaths.build()
             repository = try JobRepository(databaseURL: paths.databaseURL)
             jobs = try repository.fetchAllJobs()
         } catch {

@@ -19,7 +19,7 @@ Cross-platform desktop app (macOS + Windows target) for local/offline transcript
 - Settings modal:
   - quality profile
   - language mode
-  - diarization on/off
+  - mandatory speaker diarization
   - output folder
   - optional Python path
   - optional diarization Python path
@@ -44,7 +44,7 @@ source .venv/bin/activate
 pip install -r Scripts/requirements.txt
 ```
 
-Optional for real speaker diarization (`whisperx` + `pyannote`):
+Required for speaker diarization (`whisperx` + `pyannote`):
 
 ```bash
 cd ".."
@@ -68,7 +68,7 @@ Optional for better `.mp4` normalization and duration probing:
 ## Run (dev)
 
 ```bash
-cd ghostmic-cross
+cd vukhoai-cross
 npm install
 npm run tauri dev
 ```
@@ -89,12 +89,12 @@ export HF_TOKEN="your_hugging_face_token"
 ## Build
 
 ```bash
-cd ghostmic-cross
+cd vukhoai-cross
 npm run tauri build -- --debug
 ```
 
 Output artifacts are in:
-- `ghostmic-cross/src-tauri/target/debug/bundle/`
+- `vukhoai-cross/src-tauri/target/debug/bundle/`
 
 ## Windows regular-user flow
 
@@ -106,7 +106,7 @@ If you just want a runnable Windows app and do not want to install Rust/Node/Pyt
 That entrypoint now tries to download the latest ready-made portable Windows ZIP from GitHub Releases first. Only if no release is available does it fall back to a local source build.
 
 Detailed Windows packaging notes are in:
-- `ghostmic-cross/WINDOWS_PORTABLE_BUILD.md`
+- `vukhoai-cross/WINDOWS_PORTABLE_BUILD.md`
 
 ## Data storage
 

@@ -10,17 +10,8 @@ final class AppSettings: ObservableObject {
         static let openAIModel = "vukhoai.openai_model"
     }
 
-    private enum LegacyKeys {
-        static let profile = "ghostmic.profile"
-        static let languageMode = "ghostmic.language_mode"
-        static let diarizationEnabled = "ghostmic.diarization_enabled"
-        static let outputFolder = "ghostmic.output_folder"
-        static let openAIModel = "ghostmic.openai_model"
-    }
-
     private enum SecretKeys {
         static let service = "com.vukhoai.openai"
-        static let legacyService = "com.ghostmic.openai"
         static let account = "api_key"
     }
 
@@ -48,18 +39,14 @@ final class AppSettings: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
-        Self.migrateLegacyDefaultsIfNeeded(defaults)
         defaultProfile = TranscriptionProfile(rawValue: defaults.string(forKey: Keys.profile) ?? "") ?? .maximumQuality
         languageMode = LanguageMode(rawValue: defaults.string(forKey: Keys.languageMode) ?? "") ?? .ukrainian
-        diarizationEnabled = defaults.object(forKey: Keys.diarizationEnabled) as? Bool ?? true
+        diarizationEnabled = defaults.object(forKey: Keys.diarizationEnabled) as? Bool ?? false
         openAIModel = defaults.string(forKey: Keys.openAIModel) ?? "gpt-4o-mini"
 
         let resolvedOutputFolderPath: String
         if let savedPath = defaults.string(forKey: Keys.outputFolder) {
-            resolvedOutputFolderPath = Self.migrateLegacyOutputFolderPathIfNeeded(savedPath)
-            if resolvedOutputFolderPath != savedPath {
-                defaults.set(resolvedOutputFolderPath, forKey: Keys.outputFolder)
-            }
+            resolvedOutputFolderPath = savedPath
         } else {
             resolvedOutputFolderPath = Self.defaultOutputDirectory().path
             defaults.set(resolvedOutputFolderPath, forKey: Keys.outputFolder)
@@ -112,13 +99,11 @@ final class AppSettings: ObservableObject {
         }
 
         try KeychainStore.save(service: SecretKeys.service, account: SecretKeys.account, value: trimmed)
-        try? KeychainStore.delete(service: SecretKeys.legacyService, account: SecretKeys.account)
         hasOpenAIAPIKey = true
     }
 
     func clearOpenAIAPIKey() throws {
         try KeychainStore.delete(service: SecretKeys.service, account: SecretKeys.account)
-        try? KeychainStore.delete(service: SecretKeys.legacyService, account: SecretKeys.account)
         hasOpenAIAPIKey = false
     }
 
@@ -132,68 +117,6 @@ final class AppSettings: ObservableObject {
     }
 
     private static func readOpenAIAPIKeyFromKeychain() throws -> String? {
-        if let current = try KeychainStore.read(service: SecretKeys.service, account: SecretKeys.account),
-           !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return current
-        }
-
-        if let legacy = try KeychainStore.read(service: SecretKeys.legacyService, account: SecretKeys.account),
-           !legacy.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            try? KeychainStore.save(service: SecretKeys.service, account: SecretKeys.account, value: legacy)
-            return legacy
-        }
-
-        return nil
-    }
-
-    private static func legacyDefaultOutputDirectory() -> URL {
-        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents", isDirectory: true)
-
-        return documents
-            .appendingPathComponent("GhostMic", isDirectory: true)
-            .appendingPathComponent("Exports", isDirectory: true)
-    }
-
-    private static func migrateLegacyDefaultsIfNeeded(_ defaults: UserDefaults) {
-        migrateString(defaults, from: LegacyKeys.profile, to: Keys.profile)
-        migrateString(defaults, from: LegacyKeys.languageMode, to: Keys.languageMode)
-        migrateBool(defaults, from: LegacyKeys.diarizationEnabled, to: Keys.diarizationEnabled)
-        migrateString(defaults, from: LegacyKeys.openAIModel, to: Keys.openAIModel)
-        migrateString(defaults, from: LegacyKeys.outputFolder, to: Keys.outputFolder) { rawPath in
-            migrateLegacyOutputFolderPathIfNeeded(rawPath)
-        }
-    }
-
-    private static func migrateString(
-        _ defaults: UserDefaults,
-        from legacyKey: String,
-        to currentKey: String,
-        transform: ((String) -> String)? = nil
-    ) {
-        guard defaults.object(forKey: currentKey) == nil,
-              let legacyValue = defaults.string(forKey: legacyKey) else {
-            return
-        }
-
-        defaults.set(transform?(legacyValue) ?? legacyValue, forKey: currentKey)
-    }
-
-    private static func migrateBool(_ defaults: UserDefaults, from legacyKey: String, to currentKey: String) {
-        guard defaults.object(forKey: currentKey) == nil,
-              defaults.object(forKey: legacyKey) != nil else {
-            return
-        }
-
-        defaults.set(defaults.bool(forKey: legacyKey), forKey: currentKey)
-    }
-
-    private static func migrateLegacyOutputFolderPathIfNeeded(_ rawPath: String) -> String {
-        let legacyPath = legacyDefaultOutputDirectory().standardizedFileURL.path
-        let candidatePath = URL(fileURLWithPath: rawPath, isDirectory: true).standardizedFileURL.path
-        if candidatePath == legacyPath {
-            return defaultOutputDirectory().path
-        }
-        return rawPath
+        try KeychainStore.read(service: SecretKeys.service, account: SecretKeys.account)
     }
 }
